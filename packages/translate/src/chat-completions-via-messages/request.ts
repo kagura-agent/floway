@@ -161,10 +161,37 @@ const CHAT_TOOL_CHOICES = {
 } satisfies Record<Extract<ChatCompletionsPayload['tool_choice'], string>, MessagesPayload['tool_choice']>;
 
 export const translateChatCompletionsToMessages = async (payload: ChatCompletionsPayload, options: TranslateChatCompletionsToMessagesOptions = {}): Promise<MessagesPayload> => {
-  // System / developer messages pass through inline as Messages role: 'system'
-  // items (the Messages role enum supports it). Chat Completions has no
-  // canonical top-level system field, so nothing is hoisted to MessagesPayload.system.
-  const messages = await buildMessagesInput(payload.messages, options.loadRemoteImage ?? fetchRemoteImage);
+  // Chat Completions system/developer messages are hoisted to the top-level
+  // `system` field in the Messages payload. While the Messages protocol type
+  // includes a role: 'system' variant, some upstreams (notably Copilot) reject
+  // inline system messages and require the top-level parameter.
+  const allMessages = await buildMessagesInput(payload.messages, options.loadRemoteImage ?? fetchRemoteImage);
+
+  // Separate system messages from conversation messages
+  const systemBlocks: (string | MessagesTextBlock[])[] = [];
+  const messages: MessagesMessage[] = [];
+  for (const msg of allMessages) {
+    if (msg.role === 'system') {
+      systemBlocks.push(msg.content);
+    } else {
+      messages.push(msg);
+    }
+  }
+
+  // Flatten system blocks into a single string or text-block array
+  let system: string | MessagesTextBlock[] | undefined;
+  if (systemBlocks.length > 0) {
+    const textParts: MessagesTextBlock[] = [];
+    for (const block of systemBlocks) {
+      if (typeof block === 'string') {
+        if (block) textParts.push({ type: 'text', text: block });
+      } else {
+        textParts.push(...block);
+      }
+    }
+    // Simplify to a plain string when there's exactly one text block
+    system = textParts.length === 1 ? textParts[0].text : textParts.length > 0 ? textParts : undefined;
+  }
 
   const maxTokens = payload.max_tokens ?? options.fallbackMaxOutputTokens ?? MESSAGES_FALLBACK_MAX_TOKENS;
   const tools = payload.tools?.length ? translateChatCompletionsTools(payload.tools) : undefined;
@@ -194,6 +221,7 @@ export const translateChatCompletionsToMessages = async (payload: ChatCompletion
     model: payload.model,
     messages,
     max_tokens: maxTokens,
+    ...(system != null ? { system } : {}),
     ...(payload.temperature != null ? { temperature: payload.temperature } : {}),
     ...(payload.top_p != null ? { top_p: payload.top_p } : {}),
     ...(payload.stop != null
