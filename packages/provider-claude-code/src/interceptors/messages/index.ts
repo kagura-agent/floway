@@ -30,7 +30,7 @@
 // The on-wire `model` field is set in `fetch.ts` from
 // `opts.model.providerData.upstreamModelId` so the chain never has to rewrite
 // it — the catalog id is already Anthropic's public alias and the dated
-// upstream id is read straight off the resolved model.
+// upstream id is read straight off `opts.model.providerData`.
 
 import { backfillRequiredFields } from './backfill-required-fields.ts';
 import { hoistUserSystemToMessages } from './hoist-user-system-to-messages.ts';
@@ -38,12 +38,14 @@ import { injectBillingBlock } from './inject-billing-block.ts';
 import { injectDefaultTemplate } from './inject-default-template.ts';
 import { injectIdentityBlock } from './inject-identity-block.ts';
 import { synthesizeMetadataUserId } from './synthesize-metadata-user-id.ts';
-import type { ClaudeCodeMessagesBoundaryCtx } from './types.ts';
+import type { MessagesBoundaryCtx } from './types.ts';
 import type { Interceptor } from '@floway-dev/interceptor';
+import type { MessagesStreamEvent } from '@floway-dev/protocols/messages';
+import type { ProviderStreamResult } from '@floway-dev/provider';
 
-export type { ClaudeCodeMessagesBoundaryCtx } from './types.ts';
+export type { MessagesBoundaryCtx } from './types.ts';
 
-export const claudeCodeMessagesChain = <TResult>(): readonly Interceptor<ClaudeCodeMessagesBoundaryCtx, object, TResult>[] => [
+export const CLAUDE_CODE_MESSAGES_BOUNDARY: readonly Interceptor<MessagesBoundaryCtx, object, ProviderStreamResult<MessagesStreamEvent>>[] = [
   backfillRequiredFields,
   synthesizeMetadataUserId,
   hoistUserSystemToMessages,

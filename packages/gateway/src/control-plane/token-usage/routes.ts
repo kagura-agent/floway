@@ -1,14 +1,16 @@
-// GET /api/token-usage — query per-key or per-user token usage records.
+// GET /api/token-usage — query per-key or per-user usage records.
 //
-// The `view` query parameter selects between two shapes: `self-by-key` returns
-// the actor's own keys, while `all-by-user` aggregates across users for admins
-// and users granted the `canViewGlobalTelemetry` flag.
+// The required `view` query parameter selects between two shapes: `self-by-key`
+// returns the actor's own keys, while `all-by-user` aggregates across users and
+// is reserved for administrators.
 
 import { aggregateUsageByUserForDisplay, aggregateUsageForDisplay } from './aggregate.ts';
 import { type CtxWithQuery } from '../../middleware/zod-validator.ts';
 import { getRepo } from '../../repo/index.ts';
 import type { tokenUsageQuery } from '../schemas.ts';
-import { resolveTelemetryView } from '../telemetry-view.ts';
+import { buildKeyToUserMap } from '../shared/key-to-user.ts';
+import { resolveUsageView } from '../shared/usage-view.ts';
+import type { TokenUsageByKeyResponse, TokenUsageByUserResponse } from '../usage-types.ts';
 
 export const tokenUsage = async (c: CtxWithQuery<typeof tokenUsageQuery>) => {
   const query = c.req.valid('query');
@@ -17,7 +19,7 @@ export const tokenUsage = async (c: CtxWithQuery<typeof tokenUsageQuery>) => {
   }
   const { start, end } = query;
 
-  const resolved = resolveTelemetryView(c, query.view, query.key_id);
+  const resolved = resolveUsageView(c, query.view, query.key_id);
   if ('error' in resolved) {
     return c.json({ error: resolved.message }, resolved.error === 'forbidden' ? 403 : 400);
   }
@@ -30,27 +32,24 @@ export const tokenUsage = async (c: CtxWithQuery<typeof tokenUsageQuery>) => {
       repo.users.listIncludingDeleted(),
       repo.apiKeys.listIncludingDeleted(),
     ]);
-    const keyToUser = new Map(keys.map(k => [k.id, k.userId] as const));
-    const records = aggregateUsageByUserForDisplay(rawRecords, keyToUser);
+    const records = aggregateUsageByUserForDisplay(rawRecords, buildKeyToUserMap(keys));
 
     if (query.include_user_metadata !== '1') return c.json(records);
     const userMetadata = users
       .map(u => ({ id: u.id, username: u.username }))
       .sort((a, b) => a.id - b.id);
-    return c.json({ records, users: userMetadata });
+    return c.json({ view: 'all-by-user', records, users: userMetadata } satisfies TokenUsageByUserResponse);
   }
 
-  const ownedIds = await repo.apiKeys.idsByUserIdIncludingDeleted(resolved.scopeUserId);
-  const ownedSet = new Set(ownedIds);
+  // Sequential so an invalid key_id short-circuits to 404 before spending the usage.query read.
+  const keys = await repo.apiKeys.listByUserIdIncludingDeleted(resolved.scopeUserId);
+  const ownedSet = new Set(keys.map(k => k.id));
   const explicitKeyId = query.key_id === '' ? undefined : query.key_id;
   if (explicitKeyId !== undefined && !ownedSet.has(explicitKeyId)) {
     return c.json({ error: 'Unknown key_id' }, 404);
   }
 
-  const [rawRecords, keys] = await Promise.all([
-    repo.usage.query({ keyId: explicitKeyId, start, end }),
-    repo.apiKeys.listByUserIdIncludingDeleted(resolved.scopeUserId),
-  ]);
+  const rawRecords = await repo.usage.query({ keyId: explicitKeyId, start, end });
   const filtered = explicitKeyId ? rawRecords : rawRecords.filter(r => ownedSet.has(r.keyId));
   const records = aggregateUsageForDisplay(filtered);
 
@@ -67,7 +66,8 @@ export const tokenUsage = async (c: CtxWithQuery<typeof tokenUsageQuery>) => {
     .map(k => ({ id: k.id, name: k.name, createdAt: k.createdAt }))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
   return c.json({
+    view: 'self-by-key',
     records: recordsWithKeyMetadata,
     keys: keyMetadata,
-  });
+  } satisfies TokenUsageByKeyResponse);
 };

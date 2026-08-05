@@ -3,11 +3,20 @@ import type { ResponsesOutputCustomToolCall, ResponsesOutputFunctionCall, Respon
 import { webSearchCallLifecycleEvents } from './web-search-lifecycle.ts';
 import { type EventFrame, eventFrame } from '../common/index.ts';
 
-const getTerminalEventName = (response: ResponsesResult): 'response.failed' | 'response.incomplete' | 'response.in_progress' | 'response.completed' => {
-  if (response.status === 'failed') return 'response.failed';
-  if (response.status === 'incomplete') return 'response.incomplete';
-  if (response.status === 'in_progress') return 'response.in_progress';
-  return 'response.completed';
+const getTerminalEventName = (response: ResponsesResult): 'response.failed' | 'response.incomplete' | 'response.completed' => {
+  switch (response.status) {
+  case 'completed': return 'response.completed';
+  case 'failed': return 'response.failed';
+  case 'incomplete': return 'response.incomplete';
+  case 'queued':
+  case 'in_progress':
+  case 'cancelled':
+    throw new TypeError(`Cannot expand nonterminal Responses status '${response.status}' into terminal events`);
+  }
+  // Unreachable by the type, reachable by a value cast into it without a
+  // `status`: falling out of the switch instead minted a terminal frame typed
+  // `undefined`, which no consumer recognizes as terminal.
+  throw new TypeError(`Responses result states no terminal status (got ${JSON.stringify(response.status)})`);
 };
 
 const responsesStartSnapshot = (response: ResponsesResult): ResponsesResult => {
@@ -51,8 +60,12 @@ const responsesMessageEvents = (item: ResponsesOutputMessage, outputIndex: numbe
       item: {
         type: 'message',
         id: itemId,
+        status: 'in_progress',
         role: 'assistant',
-        content: item.content.map(part => (part.type === 'output_text' ? { type: 'output_text', text: '' } : part)),
+        content: item.content.map(part =>
+          part.type === 'output_text'
+            ? { type: 'output_text', text: '', annotations: [] }
+            : { type: 'refusal', refusal: '' }),
       },
     },
   ];
@@ -64,7 +77,7 @@ const responsesMessageEvents = (item: ResponsesOutputMessage, outputIndex: numbe
         item_id: itemId,
         output_index: outputIndex,
         content_index: contentIndex,
-        part: { type: 'output_text', text: '' },
+        part: { type: 'output_text', text: '', annotations: [] },
       });
 
       if (part.text.length > 0) {
@@ -99,7 +112,23 @@ const responsesMessageEvents = (item: ResponsesOutputMessage, outputIndex: numbe
       item_id: itemId,
       output_index: outputIndex,
       content_index: contentIndex,
-      part,
+      part: { type: 'refusal', refusal: '' },
+    });
+    if (part.refusal.length > 0) {
+      events.push({
+        type: 'response.refusal.delta',
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: contentIndex,
+        delta: part.refusal,
+      });
+    }
+    events.push({
+      type: 'response.refusal.done',
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: contentIndex,
+      refusal: part.refusal,
     });
     events.push({
       type: 'response.content_part.done',
@@ -183,10 +212,8 @@ const responsesFunctionCallEvents = (item: ResponsesOutputFunctionCall, outputIn
       type: 'response.output_item.added',
       output_index: outputIndex,
       item: {
-        type: 'function_call',
+        ...item,
         id: itemId,
-        call_id: item.call_id,
-        name: item.name,
         arguments: '',
         status: 'in_progress',
       },
@@ -294,7 +321,12 @@ const responsesOutputItemEvents = (item: ResponsesOutputItem, outputIndex: numbe
 // compaction blob is opaque; expanding them as assistant-message content
 // would mint mid-stream `output_text.delta` events that would not match the
 // item shape.
-export const responsesResultToEvents = (response: ResponsesResult, options?: { genericOutputItems?: boolean }): EventFrame<ResponsesStreamEvent>[] => {
+// `terminal` lets a caller state the terminal event instead of having it read
+// off `status`.
+export const responsesResultToEvents = (
+  response: ResponsesResult,
+  options?: { genericOutputItems?: boolean; terminal?: 'response.completed' | 'response.incomplete' | 'response.failed' },
+): EventFrame<ResponsesStreamEvent>[] => {
   const started = responsesStartSnapshot(response);
   const outputEvents = options?.genericOutputItems
     ? response.output.flatMap(responsesGenericOutputItemEvents)
@@ -303,7 +335,7 @@ export const responsesResultToEvents = (response: ResponsesResult, options?: { g
     { type: 'response.created', response: started },
     { type: 'response.in_progress', response: started },
     ...outputEvents,
-    { type: getTerminalEventName(response), response },
+    { type: options?.terminal ?? getTerminalEventName(response), response },
   ];
 
   return events.map((event, sequenceNumber) => eventFrame({ ...event, sequence_number: sequenceNumber }));

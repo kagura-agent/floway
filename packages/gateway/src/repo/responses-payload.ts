@@ -1,19 +1,7 @@
 import type { StoredResponsesItemPayload } from './types.ts';
-import { getFileProvider, sha256Hex } from '@floway-dev/platform';
+import { getFileStore, sha256Hex } from '@floway-dev/platform';
 
-// Two encodings coexist in this column:
-//   - legacy (no `encoding` field): inline `payload` is a plain object;
-//     file body is the raw payload JSON bytes
-//   - "gzip": inline `payload` is a base64 string of gzipped JSON bytes;
-//     file body is the gzipped JSON bytes
-// Writes always emit "gzip"; reads accept both so legacy rows stay
-// deserializable for the remainder of their TTL.
 type StoredResponsesPayloadJson =
-  | {
-    version: 1;
-    storage: 'inline';
-    payload: StoredResponsesItemPayload;
-  }
   | {
     version: 1;
     storage: 'inline';
@@ -23,15 +11,7 @@ type StoredResponsesPayloadJson =
   | {
     version: 1;
     storage: 'file';
-    key: string;
-    sha256: string;
-    byteLength: number;
-  }
-  | {
-    version: 1;
-    storage: 'file';
     encoding: 'gzip';
-    key: string;
     sha256: string;
     byteLength: number;
   };
@@ -39,36 +19,24 @@ type StoredResponsesPayloadJson =
 // Caps the JSON descriptor written into D1's `payload_json` column. Compressing
 // the body before this check trades a little CPU for a meaningful cut in D1
 // storage on the JSON-heavy gpt-5 transcripts the gateway stores, and the
-// cap pushes large tool outputs out to the file provider where per-byte
+// cap pushes large tool outputs out to the file store where per-byte
 // storage is dramatically cheaper than D1.
 const INLINE_PAYLOAD_LIMIT_BYTES = 64 * 1024;
-// Read only by the scheduled cleanup (payload-file sweep + descriptor clear).
-// Lookups intentionally do NOT filter by this TTL: a row stays referenceable
-// until cleanup actually removes it, so expiry is driven by the sweeper alone.
-export const RESPONSES_ITEM_PAYLOAD_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-// `refreshed_at` writes are debounced within this window. Long Responses
-// sessions touch every prior item every turn; without coalescing, per-request
-// UPDATE volume would scale with conversation history length. One UPDATE per
-// row per day shifts the row-retention sweep by at most one day relative to
-// the 180-day row TTL, well below the precision worth paying for.
-export const RESPONSES_REFRESH_DEBOUNCE_MS = 24 * 60 * 60 * 1000;
-const HOUR_MS = 60 * 60 * 1000;
-
-// Root under which every stored-payload file lives, regardless of expiry hour.
-// The replace path deletes this whole tree alongside the D1 rows it clears.
-const RESPONSES_ITEMS_FILE_ROOT = 'responses-items/v1/expires/';
+const RESPONSES_ITEMS_FILE_ROOT = 'responses-items/v2/objects/';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-export const serializeStoredResponsesPayload = async (
-  id: string,
-  apiKeyId: string | null,
-  createdAt: number,
-  payload: StoredResponsesItemPayload | null,
-): Promise<string | null> => {
-  if (payload === null) return null;
+export interface PreparedStoredResponsesPayload {
+  payloadJson: string;
+  file: { key: string; body: Uint8Array } | null;
+}
 
+export const prepareStoredResponsesPayload = async (
+  id: string,
+  apiKeyId: string,
+  payload: StoredResponsesItemPayload,
+): Promise<PreparedStoredResponsesPayload> => {
   const rawBytes = encoder.encode(JSON.stringify(payload));
   const gzippedBytes = await gzipBytes(rawBytes);
 
@@ -78,42 +46,51 @@ export const serializeStoredResponsesPayload = async (
     encoding: 'gzip',
     payload: bytesToBase64(gzippedBytes),
   } satisfies StoredResponsesPayloadJson);
-  if (encoder.encode(inlineJson).byteLength <= INLINE_PAYLOAD_LIMIT_BYTES) return inlineJson;
+  if (encoder.encode(inlineJson).byteLength <= INLINE_PAYLOAD_LIMIT_BYTES) {
+    return { payloadJson: inlineJson, file: null };
+  }
 
   // File body holds the gzipped payload bytes only. The descriptor in D1's
   // `payload_json` column carries version, storage discriminator, encoding,
-  // key, sha256, and byteLength; the body itself does not repeat them.
+  // sha256 and byteLength; `payload_file_key` stores the associated object key.
   // sha256/byteLength describe the file's actual bytes (gzipped) so file
   // integrity verification stays a plain hash-of-body check.
   const sha256 = await sha256Hex(gzippedBytes);
-  const expiresAt = createdAt + RESPONSES_ITEM_PAYLOAD_TTL_MS;
-  const apiKeyHashPrefix = (await sha256Hex(encoder.encode(apiKeyId ?? ''))).slice(0, 16);
-  const key = `${responsesItemsExpiryBucketPrefix(expiresAt)}${apiKeyHashPrefix}/${id}/${sha256}.gz`;
-  await getFileProvider().put(key, gzippedBytes);
-  return JSON.stringify({
+  const apiKeyHash = await sha256Hex(encoder.encode(apiKeyId));
+  // Producer IDs are opaque and may contain separators or unbounded text, so
+  // only their API-key-scoped digest is allowed into the object path.
+  const itemScopeHash = await sha256Hex(encoder.encode(`${apiKeyId}\0${id}`));
+  // The digest keeps content identity visible, while the random suffix gives
+  // each attempted write a unique object key. A losing concurrent write can
+  // delete its object without racing the winner for the same item.
+  const key = `${RESPONSES_ITEMS_FILE_ROOT}${apiKeyHash}/${itemScopeHash}/${sha256}-${randomFileSuffix()}.gz`;
+  const payloadJson = JSON.stringify({
     version: 1,
     storage: 'file',
     encoding: 'gzip',
-    key,
     sha256,
     byteLength: gzippedBytes.byteLength,
   } satisfies StoredResponsesPayloadJson);
+  return { payloadJson, file: { key, body: gzippedBytes } };
+};
+
+export const writePreparedStoredResponsesPayload = async (prepared: PreparedStoredResponsesPayload): Promise<void> => {
+  if (prepared.file !== null) await getFileStore().put(prepared.file.key, prepared.file.body);
 };
 
 export const parseStoredResponsesPayload = async (
   id: string,
-  raw: string | null,
-): Promise<StoredResponsesItemPayload | null> => {
-  if (raw === null) return null;
-
+  raw: string,
+  fileKey: string | null,
+): Promise<StoredResponsesItemPayload> => {
   const descriptor = parseDescriptor(id, raw);
   if (descriptor.storage === 'inline') {
-    return 'encoding' in descriptor
-      ? clonePayload(parseInlinePayloadJson(id, await ungzipToString(base64ToBytes(descriptor.payload))))
-      : clonePayload(descriptor.payload);
+    if (fileKey !== null) throw new Error(`Inline Responses payload unexpectedly owns a file for id=${id}`);
+    return parseInlinePayloadJson(id, await ungzipToString(base64ToBytes(descriptor.payload)));
   }
 
-  const body = await getFileProvider().get(descriptor.key);
+  if (fileKey === null) throw new Error(`Stored Responses payload file key missing for id=${id}`);
+  const body = await getFileStore().get(fileKey);
   if (body === null) throw new Error(`Stored Responses payload file missing for id=${id}`);
   if (body.byteLength !== descriptor.byteLength) {
     throw new Error(`Stored Responses payload file size mismatch for id=${id}`);
@@ -123,8 +100,7 @@ export const parseStoredResponsesPayload = async (
     throw new Error(`Stored Responses payload file hash mismatch for id=${id}`);
   }
 
-  const json = 'encoding' in descriptor ? await ungzipToString(body) : decoder.decode(body);
-  return clonePayload(parseInlinePayloadJson(id, json));
+  return parseInlinePayloadJson(id, await ungzipToString(body));
 };
 
 const parseInlinePayloadJson = (id: string, json: string): StoredResponsesItemPayload => {
@@ -150,23 +126,14 @@ const parseDescriptor = (id: string, raw: string): StoredResponsesPayloadJson =>
     if (parsed.encoding === 'gzip' && typeof parsed.payload === 'string') {
       return { version: 1, storage: 'inline', encoding: 'gzip', payload: parsed.payload };
     }
-    if (parsed.encoding === undefined) {
-      return { version: 1, storage: 'inline', payload: assertPayloadObject(id, parsed.payload) };
-    }
   }
   if (parsed.storage === 'file'
-    && typeof parsed.key === 'string'
     && typeof parsed.sha256 === 'string'
     && typeof parsed.byteLength === 'number'
     && Number.isSafeInteger(parsed.byteLength)
     && parsed.byteLength >= 0
   ) {
-    if (parsed.encoding === 'gzip') {
-      return { version: 1, storage: 'file', encoding: 'gzip', key: parsed.key, sha256: parsed.sha256, byteLength: parsed.byteLength };
-    }
-    if (parsed.encoding === undefined) {
-      return { version: 1, storage: 'file', key: parsed.key, sha256: parsed.sha256, byteLength: parsed.byteLength };
-    }
+    if (parsed.encoding === 'gzip') return { version: 1, storage: 'file', encoding: 'gzip', sha256: parsed.sha256, byteLength: parsed.byteLength };
   }
   throw new Error(`Invalid responses_items.payload_json for id=${id} (storage=${typeof parsed.storage === 'string' ? parsed.storage : 'unknown'}, encoding=${typeof parsed.encoding === 'string' ? parsed.encoding : 'absent'})`);
 };
@@ -177,12 +144,6 @@ const assertPayloadObject = (id: string, value: unknown): StoredResponsesItemPay
   if (Object.hasOwn(value, 'private')) payload.private = value.private;
   return payload;
 };
-
-const clonePayload = (payload: StoredResponsesItemPayload): StoredResponsesItemPayload => ({
-  ...payload,
-  item: structuredClone(payload.item),
-  ...(Object.hasOwn(payload, 'private') ? { private: structuredClone(payload.private) } : {}),
-});
 
 // Copying through `new Uint8Array(bytes)` gives Blob a concrete
 // ArrayBuffer-backed view regardless of the caller's ArrayBufferLike type
@@ -209,49 +170,18 @@ const bytesToBase64 = (bytes: Uint8Array): string => {
   return btoa(binary);
 };
 
+const randomFileSuffix = (): string => {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '');
+};
+
 const base64ToBytes = (base64: string): Uint8Array => {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 };
-
-// Files live under their expiry hour. A bucket whose hour is strictly before
-// the current hour is fully past its TTL, so the sweep enumerates the existing
-// bucket prefixes under the expiry root and deletes every expired one. Bucket
-// prefixes use UTC YYYY/MM/DD/HH, so lexical order matches chronological order.
-// This is resilient to missed cron runs: a skipped hour is revisited on the
-// next run rather than leaking into R2.
-export const sweepExpiredResponsesItemPayloadFiles = async (now: number): Promise<void> => {
-  const currentHourPrefix = responsesItemsExpiryBucketPrefix(startOfUtcHour(now));
-  const provider = getFileProvider();
-  const keys = await provider.listKeys(RESPONSES_ITEMS_FILE_ROOT);
-  const expiredBuckets = new Set<string>();
-  for (const key of keys) {
-    const pathParts = key.slice(RESPONSES_ITEMS_FILE_ROOT.length).split('/');
-    if (pathParts.length < 4) continue;
-    const bucket = `${RESPONSES_ITEMS_FILE_ROOT}${pathParts.slice(0, 4).join('/')}/`;
-    if (bucket < currentHourPrefix) expiredBuckets.add(bucket);
-  }
-  for (const bucket of expiredBuckets) await provider.deletePrefix(bucket);
-};
-
-// Drop every spilled payload file. Paired with a `deleteAll` over the
-// responses_items rows so a full replace/clear does not orphan R2 objects.
-export const deleteAllResponsesItemPayloadFiles = async (): Promise<void> => {
-  await getFileProvider().deletePrefix(RESPONSES_ITEMS_FILE_ROOT);
-};
-
-const responsesItemsExpiryBucketPrefix = (hourTimestamp: number): string => {
-  const date = new Date(hourTimestamp);
-  const yyyy = String(date.getUTCFullYear()).padStart(4, '0');
-  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(date.getUTCDate()).padStart(2, '0');
-  const hh = String(date.getUTCHours()).padStart(2, '0');
-  return `${RESPONSES_ITEMS_FILE_ROOT}${yyyy}/${mm}/${dd}/${hh}/`;
-};
-
-export const startOfUtcHour = (timestamp: number): number => Math.floor(timestamp / HOUR_MS) * HOUR_MS;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);

@@ -1,169 +1,493 @@
-import { ensureCodexAccessToken, invalidateCodexAccessToken, mintCodexAccessToken, putCodexAccessToken } from './access-token-cache.ts';
+import { ensureCodexAccessToken, invalidateCodexAccessToken, mintCodexAccessToken, putCodexAccessToken } from './access-token.ts';
 import { CodexOAuthSessionTerminatedError } from './auth/oauth.ts';
 import {
   CODEX_BACKEND_BASE,
+  CODEX_ALPHA_SEARCH_PATH,
   CODEX_ORIGINATOR,
+  CODEX_RESPONSES_COMPACT_PATH,
   CODEX_RESPONSES_PATH,
   CODEX_USER_AGENT,
 } from './constants.ts';
+import { sha256Uuid, uuidV7 } from './ids.ts';
 import {
-  getCodexQuota,
-  isCodexRateLimited,
   parseCodexQuotaHeaders,
   putCodexQuota,
 } from './quota.ts';
 import type { CodexAccountCredential } from './state.ts';
-import type { ResponsesPayload, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import type { CanonicalResponsesCompactPayload, CanonicalResponsesPayload, ResponsesCompactionResult, ResponsesInputItem, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 import { parseResponsesStream } from '@floway-dev/protocols/responses';
-import { streamingProviderCall, type ProviderStreamResult, type UpstreamCallOptions, type UpstreamModel } from '@floway-dev/provider';
+import { type ProviderCallResult, type ProviderModel, type ProviderStreamResult, streamingProviderCall, type UpstreamCallOptions } from '@floway-dev/provider';
 
-// Hooks for repo-side state transitions, applied with optimistic concurrency.
-// Refresh-token rotations and terminal-state transitions go through the repo;
-// access-token and quota persistence are handled inside their own helpers
-// (also state_json writes via the same CAS hook).
+export type ProviderCompactionResult =
+  | { ok: true; result: ResponsesCompactionResult; modelKey: string }
+  | { ok: false; response: Response; modelKey: string };
+
+// Hooks for repo-side state transitions. Refresh-token rotations and
+// terminal-state transitions go through the repo; access-token and quota
+// persistence are handled inside their own helpers, which write the same
+// state_json row the same way.
 export interface CodexCallEffects {
   persistRefreshTokenRotation(newRefreshToken: string): Promise<void>;
   persistTerminalState(state: 'session_terminated' | 'refresh_failed', message: string): Promise<void>;
 }
 
-// The transport is account-agnostic — the caller selects the credential
-// and passes it in.
-export interface CallCodexResponsesOptions {
+// Account selection for one Codex call. Both Codex endpoints share the same
+// OAuth credential, the same quota row, and the same retry contract; only the
+// wire body and the response decoding differ.
+interface CodexBackendCallBase {
   upstreamId: string;
   account: CodexAccountCredential;
-  model: UpstreamModel;
-  body: Omit<ResponsesPayload, 'model'>;
+  model: ProviderModel;
   headers: Headers;
   signal?: AbortSignal;
   effects: CodexCallEffects;
   call: UpstreamCallOptions;
 }
 
+export interface CallCodexResponsesOptions extends CodexBackendCallBase {
+  body: Omit<CanonicalResponsesPayload, 'model'>;
+}
+
+export interface CallCodexResponsesCompactOptions extends CodexBackendCallBase {
+  body: Omit<CanonicalResponsesCompactPayload, 'model' | 'store'>;
+}
+
+export interface CallCodexAlphaSearchOptions extends CodexBackendCallBase {
+  body: Record<string, unknown>;
+}
+
+type CodexResponsesBody = CallCodexResponsesOptions['body'] | CallCodexResponsesCompactOptions['body'];
+
 export const callCodexResponses = async (opts: CallCodexResponsesOptions): Promise<ProviderStreamResult<ResponsesStreamEvent>> => {
-  // Pre-fetch gates short-circuit before reaching the network. The gateway
-  // recorder still needs the contract observed (it throws on a provider that
-  // returns without ever wrapping), so each synthetic response rides through
-  // `recordUpstreamLatency` once. The captured ~0 ms is never read — the
-  // gateway records `upstream_success` failures as a counter, not a latency.
-  const syntheticReturn = async (response: Response): Promise<ProviderStreamResult<ResponsesStreamEvent>> => ({
-    ok: false,
-    modelKey: opts.model.id,
-    response: await opts.call.recordUpstreamLatency(Promise.resolve(response)),
-  });
+  const ready = await prepareCodexCall(opts);
+  if (!ready.ok) return { ok: false, modelKey: opts.model.id, response: ready.response };
+  return await performStreamingResponsesCall(opts, ready.accessToken, false);
+};
 
+export const callCodexResponsesCompact = async (opts: CallCodexResponsesCompactOptions): Promise<ProviderCompactionResult> => {
+  const ready = await prepareCodexCall(opts);
+  if (!ready.ok) return { ok: false, modelKey: opts.model.id, response: ready.response };
+  return await performUnaryCompactCall(opts, ready.accessToken, false);
+};
+
+export const callCodexAlphaSearch = async (opts: CallCodexAlphaSearchOptions): Promise<ProviderCallResult> => {
+  const requestId = stringField(opts.body, 'id') ?? uuidV7();
+  const normalized = { ...opts, body: { ...opts.body, id: requestId } };
+  const ready = await prepareCodexCall(normalized);
+  if (!ready.ok) return { modelKey: normalized.model.id, response: ready.response };
+  return await performAlphaSearchCall(normalized, ready.accessToken, false);
+};
+
+// Pre-fetch gates + initial access-token mint.
+const prepareCodexCall = async (opts: CodexBackendCallBase): Promise<{ ok: true; accessToken: string } | { ok: false; response: Response }> => {
   if (opts.account.state !== 'active') {
-    return await syntheticReturn(synthetic503(`Codex upstream is ${opts.account.state}`));
+    return { ok: false, response: synthetic503(`Codex upstream is ${opts.account.state}`) };
   }
 
-  const now = new Date();
-  const quotaSnapshot = await getCodexQuota(opts.upstreamId, opts.account.chatgptAccountId);
-  if (isCodexRateLimited(quotaSnapshot, now)) {
-    return await syntheticReturn(
-      synthetic429(`Codex upstream rate-limited until ${quotaSnapshot!.ratelimited_until!}`, quotaSnapshot!.ratelimited_until!, now),
-    );
-  }
-
-  let accessToken: string;
   try {
-    accessToken = await ensureAccessToken(opts);
+    const entry = await ensureCodexAccessToken(opts.upstreamId, opts.account.chatgptAccountId, refresh => mintAccessToken(opts, refresh));
+    return { ok: true, accessToken: entry.token };
   } catch (err) {
     if (err instanceof CodexOAuthSessionTerminatedError) {
       await opts.effects.persistTerminalState('refresh_failed', err.upstreamMessage);
-      return await syntheticReturn(synthetic503(`Codex refresh failed: ${err.upstreamMessage}`));
+      return { ok: false, response: synthetic503(`Codex refresh failed: ${err.upstreamMessage}`) };
     }
     throw err;
   }
-
-  return await performUpstreamCall(opts, accessToken, false);
 };
 
-const mintAccessToken = (opts: CallCodexResponsesOptions, refreshToken: string) =>
+const mintAccessToken = (opts: CodexBackendCallBase, refreshToken: string) =>
   mintCodexAccessToken(refreshToken, opts.call.fetcher, opts.effects.persistRefreshTokenRotation);
 
-const ensureAccessToken = async (opts: CallCodexResponsesOptions): Promise<string> => {
-  const entry = await ensureCodexAccessToken(opts.upstreamId, opts.account.chatgptAccountId, refresh => mintAccessToken(opts, refresh));
-  return entry.token;
+interface CodexRequestIdentity {
+  installationId: string;
+  sessionId: string;
+  threadId: string;
+  clientRequestId: string;
+  turnId: string;
+  windowId: string;
+}
+
+export interface CodexCompactionTurnMetadata {
+  trigger: 'manual' | 'auto';
+  reason: 'user_requested' | 'context_limit';
+  implementation: 'responses_compact' | 'responses_compaction_v2';
+  phase: 'standalone_turn' | 'mid_turn';
+  strategy: 'memento';
+}
+
+export interface CodexTurnMetadataOptions {
+  requestKind: 'turn' | 'compaction';
+  compaction?: CodexCompactionTurnMetadata;
+}
+
+export const CODEX_RESPONSES_COMPACTION_V2_TURN_METADATA: CodexTurnMetadataOptions = {
+  requestKind: 'compaction',
+  compaction: {
+    trigger: 'manual',
+    reason: 'user_requested',
+    implementation: 'responses_compaction_v2',
+    phase: 'standalone_turn',
+    strategy: 'memento',
+  },
 };
 
-const performUpstreamCall = async (
+const trimHeader = (headers: Headers, name: string): string | null => {
+  const value = headers.get(name)?.trim() ?? '';
+  return value.length > 0 ? value : null;
+};
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const stringField = (record: Record<string, unknown> | null, key: string): string | null => {
+  if (record === null) return null;
+  const value = record[key];
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+const clientCodexClientMetadata = (body: unknown): Record<string, unknown> => {
+  if (!isPlainObject(body)) return {};
+  const candidate = body.client_metadata;
+  return isPlainObject(candidate) ? candidate : {};
+};
+
+const parseClientTurnMetadataJson = (raw: string | null): Record<string, unknown> | null => {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+// Identity-mirror keys live on `identity` and are projected onto every
+// surface (headers, body's `client_metadata`, body's `x-codex-turn-metadata`
+// blob). Drop them from caller spreads so a caller that supplies the same
+// key on a different surface than identity already absorbed can't force the
+// three projections to disagree.
+const IDENTITY_MIRRORED_TURN_METADATA_KEYS = new Set<string>([
+  'installation_id', 'session_id', 'thread_id', 'turn_id', 'window_id',
+]);
+
+const IDENTITY_MIRRORED_CLIENT_METADATA_KEYS = new Set<string>([
+  'x-codex-installation-id', 'session_id', 'thread_id', 'x-codex-window-id', 'turn_id', 'x-codex-turn-metadata',
+]);
+
+const buildCodexRequestIdentity = async (
+  opts: CodexBackendCallBase,
+  body: CodexResponsesBody,
+  clientMetadata: Record<string, unknown>,
+  clientTurnMetadata: Record<string, unknown> | null,
+): Promise<CodexRequestIdentity> => {
+  // Identity priority for every mirrored id: caller-supplied header → caller
+  // body `client_metadata` key → parsed `x-codex-turn-metadata` key → gateway
+  // default. So a caller can split its identity across surfaces and we still
+  // emit consistent values everywhere.
+  const sessionId = trimHeader(opts.headers, 'session-id')
+    ?? trimHeader(opts.headers, 'session_id')
+    ?? stringField(clientMetadata, 'session_id')
+    ?? stringField(clientTurnMetadata, 'session_id')
+    ?? await deriveSessionIdFromInput(body)
+    ?? uuidV7();
+  const threadId = trimHeader(opts.headers, 'thread-id')
+    ?? stringField(clientMetadata, 'thread_id')
+    ?? stringField(clientTurnMetadata, 'thread_id')
+    ?? sessionId;
+  const clientRequestId = trimHeader(opts.headers, 'x-client-request-id') ?? threadId;
+  const installationId = stringField(clientMetadata, 'x-codex-installation-id')
+    ?? stringField(clientTurnMetadata, 'installation_id')
+    ?? opts.account.openaiDeviceId;
+  const windowId = trimHeader(opts.headers, 'x-codex-window-id')
+    ?? stringField(clientMetadata, 'x-codex-window-id')
+    ?? stringField(clientTurnMetadata, 'window_id')
+    ?? `${sessionId}:0`;
+  const turnId = stringField(clientMetadata, 'turn_id')
+    ?? stringField(clientTurnMetadata, 'turn_id')
+    ?? uuidV7();
+  return { installationId, sessionId, threadId, clientRequestId, turnId, windowId };
+};
+
+// A stateless caller that re-sends the full conversation every turn would
+// otherwise mint a fresh UUIDv7 per request and never hit chatgpt.com's
+// prompt cache. Hash `instructions` + every item up to and including the
+// first user message so the id is stable across turns of the same
+// conversation (subsequent turns append tail items after the first user
+// message, so the seed shape is unchanged) and different conversations get
+// different ids. Stateful callers using `previous_response_id` reach this
+// code path with the input already expanded from the snapshot in
+// attempt.ts, so they hash the same prefix as the original turn and get
+// the same session id — no server-side session map required.
+const deriveSessionIdFromInput = async (body: CodexResponsesBody): Promise<string | null> => {
+  const seed = seedUpToFirstUserMessage(body.input);
+  if (seed === null) return null;
+  const instructions = typeof body.instructions === 'string' ? body.instructions : '';
+  // U+0001 separates the two seed components so an empty instructions can't
+  // collide with the input prefix via string concatenation.
+  return await sha256Uuid(`${instructions}${JSON.stringify(seed)}`);
+};
+
+const seedUpToFirstUserMessage = (input: readonly ResponsesInputItem[]): readonly ResponsesInputItem[] | null => {
+  const collected: ResponsesInputItem[] = [];
+  for (const item of input) {
+    collected.push(item);
+    if (isUserMessageItem(item)) return collected;
+  }
+  return null;
+};
+
+const isUserMessageItem = (item: ResponsesInputItem): boolean =>
+  item.type === 'message' && item.role === 'user';
+
+const buildCodexTurnMetadata = (
+  identity: CodexRequestIdentity,
+  options: CodexTurnMetadataOptions,
+  clientOverrides: Record<string, unknown> | null,
+): Record<string, unknown> => {
+  const base: Record<string, unknown> = {
+    installation_id: identity.installationId,
+    session_id: identity.sessionId,
+    thread_id: identity.threadId,
+    turn_id: identity.turnId,
+    window_id: identity.windowId,
+    request_kind: options.requestKind,
+  };
+  if (options.compaction !== undefined) base.compaction = options.compaction;
+  if (clientOverrides === null) return base;
+  // Identity-mirror keys already came from `identity`; only carry the
+  // caller's extras (turn_started_at_unix_ms, sandbox, workspaces,
+  // parent_thread_id, …) into the outgoing blob.
+  for (const [k, v] of Object.entries(clientOverrides)) {
+    if (!IDENTITY_MIRRORED_TURN_METADATA_KEYS.has(k)) base[k] = v;
+  }
+  return base;
+};
+
+const buildCodexTurnMetadataJson = (
+  identity: CodexRequestIdentity,
+  options: CodexTurnMetadataOptions,
+  clientOverrides: Record<string, unknown> | null,
+): string =>
+  JSON.stringify(buildCodexTurnMetadata(identity, options, clientOverrides));
+
+const buildCodexClientMetadata = (identity: CodexRequestIdentity, turnMetadataJson: string): Record<string, string> => ({
+  'x-codex-installation-id': identity.installationId,
+  session_id: identity.sessionId,
+  thread_id: identity.threadId,
+  'x-codex-window-id': identity.windowId,
+  turn_id: identity.turnId,
+  'x-codex-turn-metadata': turnMetadataJson,
+});
+
+const buildCodexResponsesBody = (
   opts: CallCodexResponsesOptions,
+  identity: CodexRequestIdentity,
+  turnMetadataJson: string,
+): Record<string, unknown> => {
+  const callerExtras: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(clientCodexClientMetadata(opts.body))) {
+    if (!IDENTITY_MIRRORED_CLIENT_METADATA_KEYS.has(k)) callerExtras[k] = v;
+  }
+  const body: Record<string, unknown> = {
+    ...(opts.body as unknown as Record<string, unknown>),
+    model: opts.model.id,
+    store: false,
+    stream: true,
+    client_metadata: {
+      ...buildCodexClientMetadata(identity, turnMetadataJson),
+      ...callerExtras,
+    },
+  };
+  if (body.prompt_cache_key === undefined) body.prompt_cache_key = identity.threadId;
+  return body;
+};
+
+// One upstream round-trip with quota-header persistence and terminal-401
+// classification. The returned Response is what the caller relays:
+//   - 2xx: caller decodes the body (SSE for /responses, JSON for /responses/compact)
+//   - 429: quota is already snapshotted; return verbatim
+//   - 401: a `token_invalidated` error is mapped to a synthetic 503; any
+//     other 401 is rebuilt with a re-readable body so the caller can decide
+//     to retry with a fresh access token
+//   - other: returned verbatim
+const dispatchCodexHttpCall = async (
+  opts: CodexBackendCallBase,
   accessToken: string,
-  alreadyRetried: boolean,
-): Promise<ProviderStreamResult<ResponsesStreamEvent>> => {
-  // `opts.headers` is the provider's private boundary-ctx clone; mutate
-  // directly. Every header below uses `set`, so retry passes overwrite
-  // rather than accumulate.
-  const headers = opts.headers;
+  path: string,
+  accept: string,
+  body: Record<string, unknown>,
+  identity: CodexRequestIdentity,
+  turnMetadataJson: string | null,
+): Promise<Response> => {
+  const headers = new Headers();
   headers.set('authorization', `Bearer ${accessToken}`);
   headers.set('chatgpt-account-id', opts.account.chatgptAccountId);
   headers.set('originator', CODEX_ORIGINATOR);
   headers.set('user-agent', CODEX_USER_AGENT);
-  headers.set('accept', 'text/event-stream');
+  headers.set('accept', accept);
   headers.set('content-type', 'application/json');
+  headers.set('session-id', identity.sessionId);
+  headers.set('thread-id', identity.threadId);
+  headers.set('x-client-request-id', identity.clientRequestId);
+  headers.set('x-codex-window-id', identity.windowId);
+  if (turnMetadataJson !== null) headers.set('x-codex-turn-metadata', turnMetadataJson);
 
-  const upstreamFetch = opts.call.fetcher(`${CODEX_BACKEND_BASE}${CODEX_RESPONSES_PATH}`, {
+  const response = await opts.call.wrapUpstreamCall(() => opts.call.fetcher(`${CODEX_BACKEND_BASE}${path}`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ ...opts.body, model: opts.model.id, store: false, stream: true }),
+    body: JSON.stringify(body),
     signal: opts.signal,
-  }, opts.call.recordUpstreamLatency).then(async response => {
-    if (response.ok) {
-      const responseNow = new Date();
-      const snapshot = parseCodexQuotaHeaders(response.headers, { now: responseNow, isRateLimited: false });
-      registerBackgroundWrite(opts, putCodexQuota(opts.upstreamId, opts.account.chatgptAccountId, snapshot));
-      return ensureSseContentType(response);
-    }
+  }));
 
-    if (response.status === 429) {
-      const responseNow = new Date();
-      const snapshot = parseCodexQuotaHeaders(response.headers, { now: responseNow, isRateLimited: true });
-      registerBackgroundWrite(opts, putCodexQuota(opts.upstreamId, opts.account.chatgptAccountId, snapshot));
-      return response;
-    }
-
-    if (response.status === 401) {
-      const bodyText = await response.text();
-      const { code, message } = parseUpstreamError(bodyText);
-      if (code === 'token_invalidated') {
-        await opts.effects.persistTerminalState('session_terminated', message);
-        return synthetic503(`Codex session terminated: ${message}`);
-      }
-      return new Response(bodyText, { status: 401, headers: response.headers });
-    }
-
+  if (response.ok) {
+    const responseNow = new Date();
+    const snapshot = parseCodexQuotaHeaders(response.headers, { now: responseNow, isRateLimited: false });
+    registerBackgroundWrite(opts, putCodexQuota(opts.upstreamId, opts.account.chatgptAccountId, snapshot));
     return response;
-  });
+  }
+
+  if (response.status === 429) {
+    const responseNow = new Date();
+    const snapshot = parseCodexQuotaHeaders(response.headers, { now: responseNow, isRateLimited: true });
+    registerBackgroundWrite(opts, putCodexQuota(opts.upstreamId, opts.account.chatgptAccountId, snapshot));
+    return response;
+  }
+
+  if (response.status === 401) {
+    const bodyText = await response.text();
+    const { code, message } = parseUpstreamError(bodyText);
+    if (code === 'token_invalidated') {
+      await opts.effects.persistTerminalState('session_terminated', message);
+      return synthetic503(`Codex session terminated: ${message}`);
+    }
+    return new Response(bodyText, { status: 401, headers: response.headers });
+  }
+
+  return response;
+};
+
+// Force-mint a fresh access token after a 401, persisting it best-effort.
+// `ensureCodexAccessToken`'s read-then-maybe-mint is bypassed because a
+// re-read can still observe the token we just invalidated: a sibling that
+// minted before our 401 lands its `putCodexAccessToken` after our
+// invalidation, restoring the broken token, and Codex tokens carry multi-day
+// expiresAt so the freshness gate hands it straight back — sending us into an
+// immediate second 401 with `alreadyRetried` already flipped. Minting
+// unconditionally sidesteps that window, and persisting best-effort is enough
+// because the next request re-mints if its read still sees the dead token.
+const refreshAccessTokenForRetry = async (opts: CodexBackendCallBase): Promise<{ ok: true; accessToken: string } | { ok: false; response: Response }> => {
+  await invalidateCodexAccessToken(opts.upstreamId, opts.account.chatgptAccountId);
+  try {
+    const minted = await mintAccessToken(opts, opts.account.refresh_token);
+    registerBackgroundWrite(opts, putCodexAccessToken(opts.upstreamId, opts.account.chatgptAccountId, minted));
+    return { ok: true, accessToken: minted.token };
+  } catch (err) {
+    if (err instanceof CodexOAuthSessionTerminatedError) {
+      await opts.effects.persistTerminalState('refresh_failed', err.upstreamMessage);
+      return { ok: false, response: synthetic503(`Codex refresh failed: ${err.upstreamMessage}`) };
+    }
+    throw err;
+  }
+};
+
+const performStreamingResponsesCall = async (
+  opts: CallCodexResponsesOptions,
+  accessToken: string,
+  alreadyRetried: boolean,
+): Promise<ProviderStreamResult<ResponsesStreamEvent>> => {
+  const clientTurnMetadata = parseClientTurnMetadataJson(trimHeader(opts.headers, 'x-codex-turn-metadata'));
+  const clientMetadata = clientCodexClientMetadata(opts.body);
+  const identity = await buildCodexRequestIdentity(opts, opts.body, clientMetadata, clientTurnMetadata);
+  const metadata: CodexTurnMetadataOptions = opts.body.input.some(item => item.type === 'compaction_trigger') ? CODEX_RESPONSES_COMPACTION_V2_TURN_METADATA : { requestKind: 'turn' };
+  const turnMetadataJson = buildCodexTurnMetadataJson(identity, metadata, clientTurnMetadata);
+  const upstreamFetch = dispatchCodexHttpCall(
+    opts,
+    accessToken,
+    CODEX_RESPONSES_PATH,
+    'text/event-stream',
+    buildCodexResponsesBody(opts, identity, turnMetadataJson),
+    identity,
+    turnMetadataJson,
+  ).then(ensureSseContentType);
 
   const result = await streamingProviderCall(upstreamFetch, parseResponsesStream, opts.model.id, opts.signal);
 
   if (!result.ok && result.response.status === 401 && !alreadyRetried) {
-    await invalidateCodexAccessToken(opts.upstreamId, opts.account.chatgptAccountId);
-    // Force a mint here rather than going through ensureCodexAccessToken's
-    // read-then-maybe-mint. If the invalidate's CAS lost to a sibling write
-    // (a concurrent quota putCodexQuota, refresh-token rotation, or operator
-    // re-import all touch the same state_json row), the broken token still
-    // sits in the slot and a re-read would hand it back as fresh — Codex
-    // tokens carry multi-day expiresAt — sending us into an immediate second
-    // 401 with alreadyRetried already flipped. Minting unconditionally and
-    // persisting best-effort sidesteps that window; a CAS loss on persist is
-    // fine because the next request will re-mint if its read still sees the
-    // dead token.
-    let newAccessToken: string;
-    try {
-      const minted = await mintAccessToken(opts, opts.account.refresh_token);
-      registerBackgroundWrite(opts, putCodexAccessToken(opts.upstreamId, opts.account.chatgptAccountId, minted));
-      newAccessToken = minted.token;
-    } catch (err) {
-      if (err instanceof CodexOAuthSessionTerminatedError) {
-        await opts.effects.persistTerminalState('refresh_failed', err.upstreamMessage);
-        return { ok: false, modelKey: opts.model.id, response: synthetic503(`Codex refresh failed: ${err.upstreamMessage}`) };
-      }
-      throw err;
-    }
-    return await performUpstreamCall(opts, newAccessToken, true);
+    const fresh = await refreshAccessTokenForRetry(opts);
+    if (!fresh.ok) return { ok: false, modelKey: opts.model.id, response: fresh.response };
+    return await performStreamingResponsesCall(opts, fresh.accessToken, true);
   }
 
   return result;
+};
+
+const performUnaryCompactCall = async (
+  opts: CallCodexResponsesCompactOptions,
+  accessToken: string,
+  alreadyRetried: boolean,
+): Promise<ProviderCompactionResult> => {
+  const clientTurnMetadata = parseClientTurnMetadataJson(trimHeader(opts.headers, 'x-codex-turn-metadata'));
+  const clientMetadata = clientCodexClientMetadata(opts.body);
+  const identity = await buildCodexRequestIdentity(opts, opts.body, clientMetadata, clientTurnMetadata);
+  const metadata: CodexTurnMetadataOptions = { requestKind: 'compaction' };
+  const turnMetadataJson = buildCodexTurnMetadataJson(identity, metadata, clientTurnMetadata);
+  const response = await dispatchCodexHttpCall(
+    opts,
+    accessToken,
+    CODEX_RESPONSES_COMPACT_PATH,
+    'application/json',
+    { ...opts.body, model: opts.model.id },
+    identity,
+    turnMetadataJson,
+  );
+
+  if (response.status === 401 && !alreadyRetried) {
+    const fresh = await refreshAccessTokenForRetry(opts);
+    if (!fresh.ok) return { ok: false, modelKey: opts.model.id, response: fresh.response };
+    return await performUnaryCompactCall(opts, fresh.accessToken, true);
+  }
+
+  if (!response.ok) return { ok: false, modelKey: opts.model.id, response };
+
+  const result = await response.json() as ResponsesCompactionResult;
+  return { ok: true, modelKey: opts.model.id, result };
+};
+
+const performAlphaSearchCall = async (
+  opts: CallCodexAlphaSearchOptions,
+  accessToken: string,
+  alreadyRetried: boolean,
+): Promise<ProviderCallResult> => {
+  const requestId = stringField(opts.body, 'id');
+  if (requestId === null) throw new Error('Normalized Codex alpha search request is missing id');
+  const identity: CodexRequestIdentity = {
+    installationId: opts.account.openaiDeviceId,
+    sessionId: requestId,
+    threadId: requestId,
+    clientRequestId: requestId,
+    turnId: uuidV7(),
+    windowId: `${requestId}:0`,
+  };
+  const turnMetadataJson = trimHeader(opts.headers, 'x-codex-turn-metadata');
+  const response = await dispatchCodexHttpCall(
+    opts,
+    accessToken,
+    CODEX_ALPHA_SEARCH_PATH,
+    'application/json',
+    { ...opts.body, model: opts.model.id },
+    identity,
+    turnMetadataJson,
+  );
+
+  if (response.status === 401 && !alreadyRetried) {
+    const fresh = await refreshAccessTokenForRetry(opts);
+    if (!fresh.ok) return { modelKey: opts.model.id, response: fresh.response };
+    return await performAlphaSearchCall(opts, fresh.accessToken, true);
+  }
+  return { modelKey: opts.model.id, response };
 };
 
 const parseUpstreamError = (rawText: string): { code: string | null; message: string } => {
@@ -184,14 +508,6 @@ const synthetic503 = (message: string): Response => new Response(JSON.stringify(
   headers: { 'content-type': 'application/json' },
 });
 
-const synthetic429 = (message: string, retryAtIso: string, now: Date): Response => {
-  const retryAfterSeconds = Math.max(0, Math.ceil((new Date(retryAtIso).getTime() - now.getTime()) / 1000));
-  return new Response(JSON.stringify({ error: { type: 'codex_rate_limited', message, retry_at: retryAtIso } }), {
-    status: 429,
-    headers: { 'content-type': 'application/json', 'retry-after': String(retryAfterSeconds) },
-  });
-};
-
 // Codex backend serves SSE without setting `content-type: text/event-stream`
 // (observed in production: only x-codex-* + standard CDN headers come back).
 // The shared `streamingProviderCall` rejects 2xx responses lacking the SSE
@@ -206,8 +522,8 @@ const ensureSseContentType = (response: Response): Response => {
 
 // Hand best-effort writes to waitUntil so workerd does not cancel them when
 // the streaming response returns; the swallow guards against recoverable
-// noise (CAS losses on access-token / quota state_json rows, transient
-// storage errors) tripping the request.
-const registerBackgroundWrite = (opts: CallCodexResponsesOptions, write: Promise<void>): void => {
+// noise (transient storage errors, a state_json write that lost every one of
+// its retries) tripping the request.
+const registerBackgroundWrite = (opts: CodexBackendCallBase, write: Promise<void>): void => {
   opts.call.waitUntil(write.catch(() => {}));
 };

@@ -8,8 +8,7 @@
 //                             (`completion`/`tools`/`thinking`/`vision`/
 //                             `embedding`) and the `model_info` map (keyed by
 //                             a varying-per-architecture prefix that carries
-//                             `<arch>.context_length` and
-//                             `<arch>.embedding_length`).
+//                             `<arch>.context_length`).
 //
 // We fan out one /api/show per tag in parallel and synthesize the per-model
 // shape the gateway consumes. /api/show calls are independent and read-only;
@@ -21,7 +20,7 @@
 
 import type { OllamaUpstreamConfig } from './config.ts';
 import { ollamaFetchShow, ollamaFetchTags } from './fetch.ts';
-import { fetchUpstreamModels, type Fetcher } from '@floway-dev/provider';
+import { fetchUpstreamModels, type Fetcher, identityWrapUpstreamCall } from '@floway-dev/provider';
 
 export interface OllamaRawModel {
   // The slug Ollama uses everywhere (e.g. `gpt-oss:120b`, `deepseek-v4-flash`,
@@ -31,11 +30,6 @@ export interface OllamaRawModel {
   modifiedAt?: number;
   capabilities: ReadonlySet<string>;
   contextLength?: number;
-  embeddingLength?: number;
-  family?: string;
-  architecture?: string;
-  parameterCount?: number;
-  quantizationLevel?: string;
 }
 
 export interface OllamaCatalog {
@@ -104,26 +98,13 @@ const parseShowResponse = (id: string, modifiedAt: number | undefined, value: un
     }
   }
 
-  const details = isRecord(value.details) ? value.details : null;
   const modelInfo = isRecord(value.model_info) ? value.model_info : null;
 
   const raw: OllamaRawModel = { id, capabilities };
   if (modifiedAt !== undefined) raw.modifiedAt = modifiedAt;
-  if (details) {
-    const family = optionalStringField(details.family);
-    if (family) raw.family = family;
-    const quant = optionalStringField(details.quantization_level);
-    if (quant) raw.quantizationLevel = quant;
-  }
   if (modelInfo) {
-    const architecture = optionalStringField(modelInfo['general.architecture']);
-    if (architecture) raw.architecture = architecture;
-    const paramCount = optionalNumberField(modelInfo['general.parameter_count']);
-    if (paramCount !== undefined && paramCount > 0) raw.parameterCount = paramCount;
     const contextLength = findArchSuffixedNumber(modelInfo, '.context_length');
     if (contextLength !== undefined) raw.contextLength = contextLength;
-    const embeddingLength = findArchSuffixedNumber(modelInfo, '.embedding_length');
-    if (embeddingLength !== undefined) raw.embeddingLength = embeddingLength;
   }
 
   return raw;
@@ -137,7 +118,7 @@ const fetchShowForTag = async (
   const response = await ollamaFetchShow(
     config,
     { method: 'POST', body: JSON.stringify({ name: tag.name }) },
-    { fetcher },
+    { fetcher, wrapUpstreamCall: identityWrapUpstreamCall },
   );
   if (!response.ok) return null;
   let parsed: unknown;
@@ -155,7 +136,7 @@ export const fetchOllamaCatalog = async (config: OllamaUpstreamConfig, fetcher: 
   // provider's catalog fetch produces, which the control-plane and SWR cache
   // both branch on.
   const tags = await fetchUpstreamModels(
-    () => ollamaFetchTags(config, { method: 'GET' }, { fetcher }),
+    () => ollamaFetchTags(config, { method: 'GET' }, { fetcher, wrapUpstreamCall: identityWrapUpstreamCall }),
     parseTagsResponse,
   );
   // /api/show fan-out stays outside the scaffold: `allSettled` already drops

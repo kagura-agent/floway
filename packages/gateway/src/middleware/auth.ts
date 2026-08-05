@@ -2,8 +2,8 @@ import type { Context, Next } from 'hono';
 
 import { getRepo } from '../repo/index.ts';
 import type { ApiKey, User } from '../repo/types.ts';
-import { timingSafeEqual } from '../shared/passwords.ts';
-import { getEnv } from '@floway-dev/platform';
+import { timingSafeEqual } from '../shared/timing-safe-equal.ts';
+import { getEnvOptional } from '@floway-dev/platform';
 
 const PUBLIC_PATHS = new Set(['/api/health', '/favicon.ico']);
 const AUTH_VALIDATE_PATHS = new Set(['/auth/login']);
@@ -29,7 +29,14 @@ export const authMiddleware = async (c: AuthedContext, next: Next) => {
   if (PUBLIC_PATHS.has(path) && c.req.method === 'GET') return await next();
   if (AUTH_VALIDATE_PATHS.has(path) && c.req.method === 'POST') return await next();
 
-  const sessionToken = c.req.header('x-floway-session');
+  // Browsers cannot attach custom headers to EventSource, so the dump SSE
+  // stream — the only browser-driven SSE endpoint — accepts the session
+  // token as a query string instead. Path/method are pinned to the single
+  // endpoint that needs it to keep the URL-leak surface narrow.
+  const isDumpStreamGet = c.req.method === 'GET'
+    && /^\/api\/dump\/keys\/[^/]+\/stream$/.test(path);
+  const sessionToken = c.req.header('x-floway-session')
+    ?? (isDumpStreamGet ? c.req.query('session') : undefined);
   if (sessionToken) {
     if (!(path.startsWith('/api/') || path.startsWith('/auth/'))) {
       return c.json({ error: 'Session tokens are only valid on dashboard routes; data-plane requests must use an API key.' }, 401);
@@ -49,7 +56,7 @@ export const authMiddleware = async (c: AuthedContext, next: Next) => {
   const rawKey = extractApiKey(c);
   if (!rawKey) return c.json({ error: 'Unauthorized' }, 401);
 
-  const adminKey = getEnv('ADMIN_KEY');
+  const adminKey = getEnvOptional('ADMIN_KEY', '');
   if (adminKey) {
     const utf8 = new TextEncoder();
     if (timingSafeEqual(utf8.encode(rawKey), utf8.encode(adminKey))) {
@@ -57,22 +64,42 @@ export const authMiddleware = async (c: AuthedContext, next: Next) => {
     }
   }
 
-  const apiKey = await getRepo().apiKeys.findByRawKey(rawKey);
-  if (!apiKey) return c.json({ error: 'Unauthorized' }, 401);
-  const user = await getRepo().users.getById(apiKey.userId);
-  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+  if (!(await authenticateApiKey(c, rawKey))) return c.json({ error: 'Unauthorized' }, 401);
+  await next();
+};
 
+// Re-resolving the presented credential at each logical WebSocket request
+// revokes rotated/deleted keys and applies the current key and user policies.
+export const authenticateApiKey = async (c: AuthedContext, rawKey: string): Promise<boolean> => {
+  const apiKey = await getRepo().apiKeys.findByRawKey(rawKey);
+  if (!apiKey) return false;
+  const user = await getRepo().users.getById(apiKey.userId);
+  if (!user) return false;
   c.set('apiKey', apiKey);
   c.set('user', user);
-  await next();
+  return true;
+};
+
+// Normalize a present-but-empty / whitespace-only credential source to
+// undefined. '' is not nullish, so without this it would latch the `??`
+// fallback chain below and shadow a valid lower-priority credential — the
+// request then 401s with the real key never consulted. Non-standard clients
+// hit this: e.g. Xcode's Claude agent custom-endpoint workaround sends an
+// empty x-api-key alongside a real Authorization: Bearer. Trimming also
+// tolerates keys copy-pasted with stray surrounding whitespace.
+const presentOrUndefined = (v: string | null | undefined): string | undefined => {
+  const trimmed = v?.trim();
+  if (!trimmed) return undefined;
+  return trimmed;
 };
 
 const extractApiKey = (c: Context): string | null => {
   const url = new URL(c.req.url);
-  return url.searchParams.get('key')
-    ?? c.req.header('x-api-key')
-    ?? c.req.header('x-goog-api-key')
-    ?? c.req.header('authorization')?.replace(/^Bearer\s+/i, '')
+  const bearer = c.req.header('authorization')?.replace(/^Bearer\s+/i, '');
+  return presentOrUndefined(url.searchParams.get('key'))
+    ?? presentOrUndefined(c.req.header('x-api-key'))
+    ?? presentOrUndefined(c.req.header('x-goog-api-key'))
+    ?? presentOrUndefined(bearer)
     ?? null;
 };
 
@@ -95,11 +122,6 @@ export const userFromContext = (c: AuthedContext): User => {
 
 export const sessionIdFromContext = (c: AuthedContext): string | undefined => c.get('sessionId');
 
-// Pure derivation off the User row — admins inherit global-telemetry
-// access, regular users carry the explicit flag. Lives next to the auth
-// helpers so the rule has one home.
-export const canViewGlobalTelemetry = (user: User): boolean => user.isAdmin || user.canViewGlobalTelemetry;
-
 // Per-user upstream cap. null = unrestricted at the user level.
 export const userUpstreamIdsFromContext = (c: AuthedContext): readonly string[] | null =>
   c.get('user')?.upstreamIds ?? null;
@@ -107,7 +129,7 @@ export const userUpstreamIdsFromContext = (c: AuthedContext): readonly string[] 
 // Effective upstream whitelist for this request: intersect the per-user cap
 // with the per-key whitelist. null = unrestricted. Session-only requests
 // resolve to the per-user cap alone (apiKey is absent). Data-plane reads
-// this to constrain provider/binding selection.
+// this to constrain provider/candidate selection.
 export const effectiveUpstreamIdsFromContext = (c: AuthedContext): readonly string[] | null => {
   const userIds = c.get('user')?.upstreamIds ?? null;
   const keyIds = c.get('apiKey')?.upstreamIds ?? null;

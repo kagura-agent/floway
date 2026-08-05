@@ -1,10 +1,10 @@
 // Gateway-managed Codex credential state, persisted in upstreams.state_json.
-// Writes happen via UpstreamRepo.saveState with optimistic concurrency keyed
-// on the prior state JSON.
+// Writes happen via UpstreamRepo.saveState, which read-modify-writes the row
+// and replays the mutator whenever a concurrent writer wins.
 
 import type { CodexQuotaSnapshot } from './quota.ts';
 
-export type CodexCredentialHealth = 'active' | 'session_terminated' | 'refresh_failed';
+export type CodexAccountCredentialHealth = 'active' | 'session_terminated' | 'refresh_failed';
 
 // Short-lived OAuth access token minted by exchanging the stored refresh_token
 // against /oauth/token. The refresh_token itself stays on CodexAccountCredential
@@ -18,11 +18,13 @@ export interface CodexAccessTokenEntry {
 
 // Most recent quota observation derived from upstream response headers.
 // `fetchedAt` is unix ms; `data` is the parsed snapshot, validated by quota.ts
-// at the boundary where it's read for dashboard display / rate-limit checks.
+// at the boundary where it's read for dashboard display.
 export interface CodexQuotaSnapshotEntry {
   fetchedAt: number;
   data: CodexQuotaSnapshot;
 }
+
+export type CodexQuotaSnapshotEntryMap = Record<string, CodexQuotaSnapshotEntry>;
 
 // One account's autonomous credential state, joined back to its identity in
 // CodexUpstreamConfig.accounts via `chatgptAccountId`.
@@ -31,20 +33,24 @@ export interface CodexAccountCredential {
   // OpenAI rotates refresh_token on every /oauth/token call. Stored in D1
   // (not KV) so KV eviction never forces operator re-import.
   refresh_token: string;
-  state: CodexCredentialHealth;
+  state: CodexAccountCredentialHealth;
   state_message?: string;
   // ISO 8601, written on every state transition (initial import, rotation,
   // terminal-state flip). The mutation paths in routes.ts and provider.ts
   // always set it together with `state`, so it's required on the wire.
   state_updated_at: string;
-  // Pre-existing rows from before these fields were added carry no key at all
-  // on the wire. The asserter accepts that absent-key case unchanged so we
-  // never mutate the input (which would poison CAS via the caller's
-  // `fresh.state` reference); `readCodexUpstreamState` is the boundary that
-  // normalizes absent → `null` on a shallow copy, so consumers can rely on
-  // the typed `null` slot here.
+  // Stable per-account installation id, surfaced to the Codex upstream as
+  // `client_metadata['x-codex-installation-id']` so per-account requests look
+  // like a single persisted device rather than rotating per call. Minted at
+  // import time; the matching D1 / sqlite migration backfills the field on
+  // older rows so the contract is closed end-to-end.
+  openaiDeviceId: string;
+  // accessToken / quotaSnapshot were added after the initial schema; absent on
+  // pre-existing rows. The asserter accepts that absent-key case unchanged;
+  // `readCodexUpstreamState` is the boundary that normalizes absent → `null`
+  // on a shallow copy, so consumers can rely on the typed `null` slot here.
   accessToken: CodexAccessTokenEntry | null;
-  quotaSnapshot: CodexQuotaSnapshotEntry | null;
+  quotaSnapshot: CodexQuotaSnapshotEntryMap | null;
 }
 
 // Account-pool state. v1 always carries exactly one entry; the asserter
@@ -53,12 +59,25 @@ export interface CodexUpstreamState {
   accounts: CodexAccountCredential[];
 }
 
+export const findCodexAccountIndex = (state: CodexUpstreamState, accountId: string): number =>
+  state.accounts.findIndex(account => account.chatgptAccountId === accountId);
+
+export const replaceCodexAccount = (
+  state: CodexUpstreamState,
+  index: number,
+  patch: (account: CodexAccountCredential) => CodexAccountCredential,
+): CodexUpstreamState => ({
+  ...state,
+  accounts: state.accounts.map((account, currentIndex) => currentIndex === index ? patch(account) : account),
+});
+
 const ALLOWED_CREDENTIAL_KEYS_MAP: Record<keyof CodexAccountCredential, true> = {
   chatgptAccountId: true,
   refresh_token: true,
   state: true,
   state_message: true,
   state_updated_at: true,
+  openaiDeviceId: true,
   accessToken: true,
   quotaSnapshot: true,
 };
@@ -84,7 +103,7 @@ const assertCodexAccessTokenEntry = (value: unknown, where: string): void => {
   }
   const obj = value as Record<string, unknown>;
   for (const key of Object.keys(obj)) {
-    if (!(key in ALLOWED_ACCESS_TOKEN_KEYS_MAP)) {
+    if (!Object.hasOwn(ALLOWED_ACCESS_TOKEN_KEYS_MAP, key)) {
       throw new TypeError(`${where} has unexpected key '${key}'`);
     }
   }
@@ -109,7 +128,7 @@ const assertCodexQuotaSnapshotEntry = (value: unknown, where: string): void => {
   }
   const obj = value as Record<string, unknown>;
   for (const key of Object.keys(obj)) {
-    if (!(key in ALLOWED_QUOTA_SNAPSHOT_KEYS_MAP)) {
+    if (!Object.hasOwn(ALLOWED_QUOTA_SNAPSHOT_KEYS_MAP, key)) {
       throw new TypeError(`${where} has unexpected key '${key}'`);
     }
   }
@@ -121,13 +140,28 @@ const assertCodexQuotaSnapshotEntry = (value: unknown, where: string): void => {
   }
 };
 
+const isUnsafeMapKey = (key: string): boolean => key === '' || key === '__proto__' || key === 'constructor' || key === 'prototype';
+
+const assertCodexQuotaSnapshotEntryMap = (value: unknown, where: string): void => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError(`${where} must be a plain object`);
+  }
+  const obj = value as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (isUnsafeMapKey(key)) {
+      throw new TypeError(`${where} has invalid active limit key '${key}'`);
+    }
+    assertCodexQuotaSnapshotEntry(obj[key], `${where}.${key}`);
+  }
+};
+
 const assertCodexAccountCredential = (value: unknown, where: string): void => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TypeError(`${where} must be a plain object`);
   }
   const obj = value as Record<string, unknown>;
   for (const key of Object.keys(obj)) {
-    if (!(key in ALLOWED_CREDENTIAL_KEYS_MAP)) {
+    if (!Object.hasOwn(ALLOWED_CREDENTIAL_KEYS_MAP, key)) {
       throw new TypeError(`${where} has unexpected key '${key}'`);
     }
   }
@@ -146,18 +180,19 @@ const assertCodexAccountCredential = (value: unknown, where: string): void => {
   if (typeof obj.state_updated_at !== 'string' || obj.state_updated_at === '') {
     throw new TypeError(`${where}.state_updated_at must be a non-empty ISO string`);
   }
+  if (typeof obj.openaiDeviceId !== 'string' || obj.openaiDeviceId === '') {
+    throw new TypeError(`${where}.openaiDeviceId must be a non-empty string`);
+  }
   // accessToken / quotaSnapshot were added after the initial schema; absent on
   // pre-existing rows. Accept the absent-key case verbatim and only validate
-  // the shape when the key is present and non-null. Mutating the input here
-  // (e.g. defaulting to null in place) would propagate through the caller's
-  // `fresh.state` reference and poison the CAS `expectedState` — the absent →
-  // `null` normalization to satisfy the typed contract happens in
+  // the shape when the key is present and non-null; the absent → `null`
+  // normalization that satisfies the typed contract happens in
   // `readCodexUpstreamState` on a shallow copy instead.
   if (obj.accessToken !== undefined && obj.accessToken !== null) {
     assertCodexAccessTokenEntry(obj.accessToken, `${where}.accessToken`);
   }
   if (obj.quotaSnapshot !== undefined && obj.quotaSnapshot !== null) {
-    assertCodexQuotaSnapshotEntry(obj.quotaSnapshot, `${where}.quotaSnapshot`);
+    assertCodexQuotaSnapshotEntryMap(obj.quotaSnapshot, `${where}.quotaSnapshot`);
   }
 };
 
@@ -169,7 +204,7 @@ export function assertCodexUpstreamState(value: unknown): asserts value is Codex
   // state_json round-trips through canonical serialization, so any surviving
   // key is persisted. Reject unknown keys to keep the on-disk shape closed.
   for (const key of Object.keys(obj)) {
-    if (!(key in ALLOWED_STATE_KEYS_MAP)) {
+    if (!Object.hasOwn(ALLOWED_STATE_KEYS_MAP, key)) {
       throw new TypeError(`CodexUpstreamState has unexpected key '${key}'`);
     }
   }
@@ -188,9 +223,9 @@ export function assertCodexUpstreamState(value: unknown): asserts value is Codex
 // `quotaSnapshot` key; the typed contract on `CodexAccountCredential`
 // promises `null` rather than `undefined`. Build a shallow copy of the
 // state with absent → `null` so consumers can rely on `=== null` checks
-// without seeing legacy rows escape unfilled. The original `raw` is left
-// untouched so callers (e.g. access-token-cache, quota) can still pass it
-// straight through as the CAS `expectedState`.
+// without seeing legacy rows escape unfilled. `raw` is left untouched, which
+// keeps the state-write helpers free to hand it straight back to the repo to
+// say there is nothing to write.
 export const readCodexUpstreamState = (raw: unknown): CodexUpstreamState => {
   assertCodexUpstreamState(raw);
   return {

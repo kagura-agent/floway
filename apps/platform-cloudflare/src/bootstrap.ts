@@ -1,13 +1,19 @@
+import { DurableObjectChannelBroker, type BroadcastNamespace } from './durable-object-channel-broker.ts';
+import { createCloudflareExternalResourceFetcher } from './external-resource-fetcher.ts';
 import { createCloudflareImageProcessor, type ImagesBinding } from './image-processor.ts';
-import { KvImageCache, type KvNamespace } from './kv-image-cache.ts';
-import { R2FileProvider, type R2BucketLike } from './r2-file-provider.ts';
+import { KvImageCacheStore, type KvNamespace } from './kv-image-cache-store.ts';
+import { R2FileStore, type R2BucketLike } from './r2-file-store.ts';
+import { cloudflareRuntimeRootCAs } from './runtime-root-cas.ts';
 import { cloudflareSocketDial } from './socket-dial.ts';
-import { cloudflareRuntimeRootCAs } from './tls-trust.ts';
+import { FileDumpStore, initDumpBroker, initDumpStore } from '@floway-dev/gateway';
+import { dumpCodec } from '@floway-dev/gateway/dump-codec';
+import type { DumpMetadata } from '@floway-dev/gateway/dump-types';
 import { addTrustedRootCAs } from '@floway-dev/http';
 import {
   IMAGE_CACHE_POLICY,
   initEnv,
-  initFileProvider,
+  initExternalResourceFetcher,
+  initFileStore,
   initImageCacheStore,
   initImageProcessor,
   initRuntimeKind,
@@ -20,18 +26,19 @@ export interface CloudflareEnv {
   FILES: R2BucketLike;
   IMAGES: ImagesBinding;
   KV: KvNamespace;
+  BROADCAST_DO: BroadcastNamespace;
   [key: string]: unknown;
 }
 
 // Every binding declared on `CloudflareEnv` is load-bearing — D1 holds all
-// config and telemetry, R2 holds spilled payloads, Images compresses inline
-// images, KV memoises compressed image results. A missing binding means
+// config and telemetry, R2 stores file-backed response payloads and dump bodies,
+// Images re-encodes images, and KV memoises the results. A missing binding means
 // wrangler.jsonc drifted from the code, so we refuse to initialise rather
 // than 503 on first use of the absent binding.
-const REQUIRED_BINDINGS = ['DB', 'FILES', 'IMAGES', 'KV'] as const;
+const REQUIRED_BINDINGS = ['DB', 'FILES', 'IMAGES', 'KV', 'BROADCAST_DO'] as const;
 
 export const bootstrapCloudflarePlatform = (env: CloudflareEnv): { db: SqlDatabase } => {
-  const missing = REQUIRED_BINDINGS.filter(name => env[name] === undefined || env[name] === null);
+  const missing = REQUIRED_BINDINGS.filter(name => env[name] === undefined);
   if (missing.length > 0) {
     throw new Error(
       `Missing required Cloudflare bindings: ${missing.join(', ')}. `
@@ -41,16 +48,18 @@ export const bootstrapCloudflarePlatform = (env: CloudflareEnv): { db: SqlDataba
 
   initEnv(name => {
     const value = env[name];
-    if (value === undefined || value === null) {
-      throw new Error(`Missing required env var: ${name}`);
-    }
-    return String(value);
+    if (typeof value !== 'string') return undefined;
+    return value;
   });
   initRuntimeKind('cloudflare');
-  initFileProvider(new R2FileProvider(env.FILES));
-  initImageCacheStore(new KvImageCache(env.KV, IMAGE_CACHE_POLICY));
+  initExternalResourceFetcher(createCloudflareExternalResourceFetcher());
+  const files = new R2FileStore(env.FILES);
+  initFileStore(files);
+  initImageCacheStore(new KvImageCacheStore(env.KV, IMAGE_CACHE_POLICY));
   initImageProcessor(createCloudflareImageProcessor(env.IMAGES));
   initSocketDial(cloudflareSocketDial);
   addTrustedRootCAs(cloudflareRuntimeRootCAs);
+  initDumpStore(new FileDumpStore(env.DB, files));
+  initDumpBroker(new DurableObjectChannelBroker<DumpMetadata>(env.BROADCAST_DO, dumpCodec));
   return { db: env.DB };
 };

@@ -31,6 +31,12 @@ const buildCodexImportResult = (params: {
       refresh_token: params.refreshToken,
       state: 'active',
       state_updated_at: params.now,
+      // Mint a fresh per-account installation id at import time. Codex CLI's
+      // `$CODEX_HOME/installation_id` is a UUIDv4 written once per device and
+      // reused forever; we mirror the shape and lifetime per Floway-managed
+      // account so each account looks like one persisted Codex install rather
+      // than a fingerprint that rotates per call.
+      openaiDeviceId: crypto.randomUUID(),
       accessToken: {
         token: params.accessToken,
         expiresAt: params.expiresAt,
@@ -70,7 +76,7 @@ export const importCodexFromAuthJson = async (rawJson: string): Promise<CodexImp
   const identity = parseCodexIdTokenClaims(idToken);
   // auth.json carries the access_token + refresh_token but no `expires_in`
   // for the access_token. Stamp a conservative 7-day fallback so the
-  // freshness gate in access-token-cache forces a /oauth/token refresh on
+  // freshness gate in the access-token module forces a /oauth/token refresh on
   // the first data-plane call rather than handing out a token of unknown
   // remaining lifetime. The refresh_token's own lifetime is set by
   // auth.openai.com and is unaffected by this fallback.

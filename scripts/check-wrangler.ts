@@ -1,11 +1,17 @@
 // Pre-deploy gate: wrangler.jsonc is gitignored, so the only place we can
-// pin its shape is wrangler.example.jsonc. We compare the real config
-// against the example structurally — every key/value in the example must
-// match the real one exactly, except <YOUR_*> placeholders, which the real
-// must override with a concrete value. Real may carry extra keys (e.g.
-// account_id, vars) and extra bindings the example doesn't list. The
-// runtime also fails fast on missing bindings, but a 503 from a freshly
-// published deploy is worse than a non-zero exit before publish.
+// pin its shape is wrangler.example.jsonc. We compare the two structurally
+// in both directions — every key/value in the example must match the real
+// one exactly, and the real must not carry keys or bindings the example
+// doesn't pin. Placeholders (`<YOUR_*>`) are the one relaxation: the real
+// must override them with a concrete value. The one personal-only key the
+// example is allowed to omit is listed in EXAMPLE_ONLY_OPTIONAL_KEYS below
+// (currently just `account_id`, which is per-contributor and would leak
+// into the checked-in example otherwise). Anything else the real config
+// needs — extra bindings, extra compat flags, a `vars` block — has to
+// land in the example first so every contributor and the deploy gate see
+// the same Worker shape. The runtime also fails fast on missing bindings,
+// but a 503 from a freshly published deploy is worse than a non-zero exit
+// before publish.
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,17 +25,25 @@ const REAL_PATH = resolve(ROOT, 'wrangler.jsonc');
 const PLACEHOLDER_RE = /^<YOUR_[A-Z0-9_]+>$/;
 const isPlaceholder = (v: unknown): v is string => typeof v === 'string' && PLACEHOLDER_RE.test(v);
 
+// Top-level keys the real config may carry without a matching example
+// entry. Kept as narrow as possible — every addition weakens the gate.
+const EXAMPLE_ONLY_OPTIONAL_KEYS = new Set(['account_id']);
+
 interface Mismatch {
   path: string;
   reason: string;
 }
 
 const fmt = (v: unknown): string => JSON.stringify(v);
+const isArray = (value: unknown): value is readonly unknown[] => Array.isArray(value);
 
 const isBindingArray = (arr: readonly unknown[]): arr is ReadonlyArray<Record<string, unknown>> =>
   arr.length > 0 && arr.every(
     e => typeof e === 'object' && e !== null && typeof (e as Record<string, unknown>).binding === 'string',
   );
+
+const isStringArray = (arr: readonly unknown[]): arr is readonly string[] =>
+  arr.length > 0 && arr.every(e => typeof e === 'string');
 
 const compare = (expected: unknown, actual: unknown, path: string, out: Mismatch[]): void => {
   if (isPlaceholder(expected)) {
@@ -39,16 +53,17 @@ const compare = (expected: unknown, actual: unknown, path: string, out: Mismatch
     return;
   }
 
-  if (Array.isArray(expected)) {
+  if (isArray(expected)) {
     if (!Array.isArray(actual)) {
       out.push({ path, reason: `expected array, got ${fmt(actual)}` });
       return;
     }
     // Bindings (d1_databases, r2_buckets, kv_namespaces, ...) are identified
     // by their `binding` name, not array position. Match each example entry
-    // to the real entry with the same binding; real may carry extras the
-    // example doesn't pin.
+    // to the real entry with the same binding, and reject any real entry
+    // whose binding name the example doesn't pin.
     if (isBindingArray(expected)) {
+      const expectedNames = new Set(expected.map(e => e.binding as string));
       for (const exp of expected) {
         const name = exp.binding as string;
         const match = actual.find(
@@ -60,6 +75,39 @@ const compare = (expected: unknown, actual: unknown, path: string, out: Mismatch
           continue;
         }
         compare(exp, match, `${path}[binding=${name}]`, out);
+      }
+      for (const act of actual) {
+        if (typeof act !== 'object' || act === null) continue;
+        const name = (act as Record<string, unknown>).binding;
+        if (typeof name !== 'string') continue;
+        if (!expectedNames.has(name)) {
+          out.push({ path: `${path}[binding=${name}]`, reason: 'binding present in wrangler.jsonc but not in the example' });
+        }
+      }
+      return;
+    }
+    // String lists — `run_worker_first`, `compatibility_flags`, `crons`,
+    // `new_sqlite_classes` — are sets, not sequences. Cloudflare states that
+    // "the order in which the patterns are listed is not significant" for
+    // `run_worker_first`:
+    // https://developers.cloudflare.com/workers/static-assets/routing/worker-script/
+    // Comparing them by position would fail a contributor's config for
+    // carrying the same entries in a different order, and would say so as an
+    // index mismatch rather than as the missing or extra entry.
+    if (isStringArray(expected)) {
+      const actualStrings = new Set(actual.filter((v): v is string => typeof v === 'string'));
+      for (const value of expected) {
+        if (!actualStrings.has(value)) out.push({ path, reason: `entry ${fmt(value)} missing` });
+      }
+      const expectedStrings = new Set(expected);
+      for (const value of actual) {
+        if (typeof value !== 'string') {
+          out.push({ path, reason: `expected a string entry, got ${fmt(value)}` });
+          continue;
+        }
+        if (!expectedStrings.has(value)) {
+          out.push({ path, reason: `entry ${fmt(value)} present in wrangler.jsonc but not in the example` });
+        }
       }
       return;
     }
@@ -76,9 +124,18 @@ const compare = (expected: unknown, actual: unknown, path: string, out: Mismatch
       out.push({ path, reason: `expected object, got ${fmt(actual)}` });
       return;
     }
+    const expectedRecord = expected as Record<string, unknown>;
     const actualRecord = actual as Record<string, unknown>;
-    for (const [key, value] of Object.entries(expected as Record<string, unknown>)) {
+    for (const [key, value] of Object.entries(expectedRecord)) {
       compare(value, actualRecord[key], path === '' ? key : `${path}.${key}`, out);
+    }
+    for (const key of Object.keys(actualRecord)) {
+      if (key in expectedRecord) continue;
+      if (path === '' && EXAMPLE_ONLY_OPTIONAL_KEYS.has(key)) continue;
+      out.push({
+        path: path === '' ? key : `${path}.${key}`,
+        reason: 'key present in wrangler.jsonc but not in the example',
+      });
     }
     return;
   }

@@ -1,7 +1,8 @@
-import { createMicrosoftGroundingWebSearchProvider } from './providers/microsoft-grounding.ts';
+import { FIXED_WEB_SEARCH_CONFIG_TEST_QUERY } from './config.ts';
+import { createJinaWebSearchProvider } from './providers/jina.ts';
+import { createMicrosoftWebIqWebSearchProvider } from './providers/microsoft-web-iq.ts';
 import { createTavilyWebSearchProvider } from './providers/tavily.ts';
-import { FIXED_SEARCH_CONFIG_TEST_QUERY } from './search-config.ts';
-import type { ConfiguredWebSearchProvider, SearchConfig, SearchConfigConnectionTestResult } from './types.ts';
+import type { ConfiguredWebSearchProvider, WebSearchConfig, WebSearchConfigConnectionTestResult, WebSearchProvider, WebSearchProviderName } from './types.ts';
 
 const toPreviewText = (content: Array<{ type: 'text'; text: string }>): string =>
   content
@@ -9,38 +10,41 @@ const toPreviewText = (content: Array<{ type: 'text'; text: string }>): string =
     .join('\n')
     .slice(0, 280);
 
-export const resolveConfiguredWebSearchProvider = (config: SearchConfig): ConfiguredWebSearchProvider => {
+// Per-provider lookup: pulls the credential out of the config slot for
+// that provider and constructs the impl. Keeps `resolveConfiguredWeb...`
+// data-driven so adding a fourth provider is one entry, not another
+// if-branch.
+const PROVIDER_FACTORIES: { [N in WebSearchProviderName]: (config: WebSearchConfig) => { apiKey: string; build: (apiKey: string) => WebSearchProvider } } = {
+  tavily: config => ({ apiKey: config.tavily.apiKey, build: createTavilyWebSearchProvider }),
+  'microsoft-web-iq': config => ({ apiKey: config.microsoftWebIq.apiKey, build: createMicrosoftWebIqWebSearchProvider }),
+  jina: config => ({ apiKey: config.jina.apiKey, build: createJinaWebSearchProvider }),
+};
+
+export const resolveConfiguredWebSearchProvider = (config: WebSearchConfig): ConfiguredWebSearchProvider => {
   if (config.provider === 'disabled') {
     return { type: 'disabled' };
   }
 
-  if (config.provider === 'tavily') {
-    return config.tavily.apiKey
-      ? {
-          type: 'enabled',
-          provider: 'tavily',
-          impl: createTavilyWebSearchProvider(config.tavily.apiKey),
-        }
-      : { type: 'missing-credential', provider: 'tavily' };
+  const factory = PROVIDER_FACTORIES[config.provider](config);
+  if (!factory.apiKey) {
+    return { type: 'missing-credential', provider: config.provider };
   }
 
-  return config.microsoftGrounding.apiKey
-    ? {
-        type: 'enabled',
-        provider: 'microsoft-grounding',
-        impl: createMicrosoftGroundingWebSearchProvider(config.microsoftGrounding.apiKey),
-      }
-    : { type: 'missing-credential', provider: 'microsoft-grounding' };
+  return {
+    type: 'enabled',
+    provider: config.provider,
+    impl: factory.build(factory.apiKey),
+  };
 };
 
-export const testSearchConfigConnection = async (config: SearchConfig): Promise<SearchConfigConnectionTestResult> => {
+export const testWebSearchConfigConnection = async (config: WebSearchConfig): Promise<WebSearchConfigConnectionTestResult> => {
   const resolved = resolveConfiguredWebSearchProvider(config);
 
   if (resolved.type === 'disabled') {
     return {
       ok: false,
       provider: 'disabled',
-      query: FIXED_SEARCH_CONFIG_TEST_QUERY,
+      query: FIXED_WEB_SEARCH_CONFIG_TEST_QUERY,
       error: {
         code: 'disabled',
         message: 'Search provider is disabled.',
@@ -52,7 +56,7 @@ export const testSearchConfigConnection = async (config: SearchConfig): Promise<
     return {
       ok: false,
       provider: resolved.provider,
-      query: FIXED_SEARCH_CONFIG_TEST_QUERY,
+      query: FIXED_WEB_SEARCH_CONFIG_TEST_QUERY,
       error: {
         code: 'missing_credential',
         message: `Missing API key for ${resolved.provider}.`,
@@ -60,13 +64,13 @@ export const testSearchConfigConnection = async (config: SearchConfig): Promise<
     };
   }
 
-  const result = await resolved.impl.search({ query: FIXED_SEARCH_CONFIG_TEST_QUERY });
+  const result = await resolved.impl.search({ query: FIXED_WEB_SEARCH_CONFIG_TEST_QUERY });
 
   if (result.type === 'error') {
     return {
       ok: false,
       provider: resolved.provider,
-      query: FIXED_SEARCH_CONFIG_TEST_QUERY,
+      query: FIXED_WEB_SEARCH_CONFIG_TEST_QUERY,
       error: {
         code: result.errorCode,
         message: result.message ?? 'Search test failed.',
@@ -85,7 +89,7 @@ export const testSearchConfigConnection = async (config: SearchConfig): Promise<
     return {
       ok: false,
       provider: resolved.provider,
-      query: FIXED_SEARCH_CONFIG_TEST_QUERY,
+      query: FIXED_WEB_SEARCH_CONFIG_TEST_QUERY,
       error: {
         code: 'no_results',
         message: 'Search returned no preview results.',
@@ -96,7 +100,7 @@ export const testSearchConfigConnection = async (config: SearchConfig): Promise<
   return {
     ok: true,
     provider: resolved.provider,
-    query: FIXED_SEARCH_CONFIG_TEST_QUERY,
+    query: FIXED_WEB_SEARCH_CONFIG_TEST_QUERY,
     results: previews,
   };
 };

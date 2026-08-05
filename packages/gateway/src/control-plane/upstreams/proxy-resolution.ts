@@ -1,10 +1,11 @@
-import { createFetcher, type ProxyEntry } from '../../dial/fetcher.ts';
-import { createPerRequestFetcherForAdmin } from '../../dial/per-request.ts';
+import { createFetcher } from '../../dial/fetcher.ts';
+import { createPerRequestFetcher } from '../../dial/per-request.ts';
+import { loadProxyCatalog } from '../../dial/proxy-catalog.ts';
 import { getRepo } from '../../repo/index.ts';
-import { DIRECT_PROXY_ID, normalizeProxyFallbackList } from '../../repo/proxy-fallback-list.ts';
+import { isDirectFallbackId, normalizeProxyFallbackList } from '../../repo/proxy-fallback-list.ts';
 import { getSocketDial } from '@floway-dev/platform';
 import { directFetcher, type Fetcher, type ProxyFallbackEntry } from '@floway-dev/provider';
-import { parseProxyUri, type ProxyUriError, runProxiedRequest } from '@floway-dev/proxy';
+import { runDirectConnectRequest, runProxiedRequest } from '@floway-dev/proxy';
 
 // Fetcher resolution for control-plane operations that fire from the
 // dashboard edit form, where the in-progress proxy_fallback_list must take
@@ -14,40 +15,32 @@ import { parseProxyUri, type ProxyUriError, runProxiedRequest } from '@floway-de
 export const resolveControlPlaneFetcher = async (opts: {
   override?: readonly ProxyFallbackEntry[];
   upstreamId?: string;
+  runtimeLocation: string;
 }): Promise<Fetcher> => {
   if (opts.override !== undefined) {
-    return await buildOverrideFetcher(opts.override, opts.upstreamId ?? 'draft');
+    return await buildOverrideFetcher(opts.override, opts.upstreamId ?? 'draft', opts.runtimeLocation);
   }
   if (opts.upstreamId !== undefined) {
-    return (await createPerRequestFetcherForAdmin())(opts.upstreamId);
+    return (await createPerRequestFetcher(opts.runtimeLocation))(opts.upstreamId);
   }
-  return directFetcher;
+  // Neither an in-progress edit nor a persisted row to read a policy from.
+  // That is the same "no policy" state an empty list expresses, so route it
+  // through the same builder instead of hard-coding a transport here.
+  return await buildOverrideFetcher([], 'draft', opts.runtimeLocation);
 };
 
-const buildOverrideFetcher = async (rawList: readonly ProxyFallbackEntry[], upstreamId: string): Promise<Fetcher> => {
+const buildOverrideFetcher = async (
+  rawList: readonly ProxyFallbackEntry[],
+  upstreamId: string,
+  runtimeLocation: string,
+): Promise<Fetcher> => {
   const list = normalizeProxyFallbackList(rawList);
-  const referenced = new Set(list.filter(entry => entry.id !== DIRECT_PROXY_ID).map(entry => entry.id));
-  if (referenced.size === 0) {
-    return directFetcher;
-  }
+  const referenced = new Set(list.filter(entry => !isDirectFallbackId(entry.id)).map(entry => entry.id));
 
   const repo = getRepo();
-  const proxies = await repo.proxies.list();
-  const proxyById = new Map<string, ProxyEntry>();
-  const parseErrors = new Map<string, ProxyUriError>();
-  for (const p of proxies) {
-    if (!referenced.has(p.id)) continue;
-    try {
-      proxyById.set(p.id, {
-        config: parseProxyUri(p.url),
-        dialTimeoutMs: p.dialTimeoutSeconds === null ? null : p.dialTimeoutSeconds * 1000,
-      });
-    } catch (err) {
-      parseErrors.set(p.id, err as ProxyUriError);
-    }
-  }
+  const { proxyById, parseErrors } = await loadProxyCatalog(repo, referenced);
 
-  const unknown = list.find(entry => entry.id !== DIRECT_PROXY_ID && !proxyById.has(entry.id) && !parseErrors.has(entry.id));
+  const unknown = list.find(entry => !isDirectFallbackId(entry.id) && !proxyById.has(entry.id) && !parseErrors.has(entry.id));
   if (unknown !== undefined) {
     throw new Error(`unknown proxy id in fallback list: ${unknown.id}`);
   }
@@ -61,10 +54,11 @@ const buildOverrideFetcher = async (rawList: readonly ProxyFallbackEntry[], upst
     repo,
     upstreamId,
     fallbackList: list,
-    currentColo: null,
+    runtimeLocation,
     proxyById,
     runProxied: runProxiedRequest,
-    runDirect: directFetcher,
+    runDirectFetch: directFetcher,
+    runDirectConnect: runDirectConnectRequest,
     socketDial: getSocketDial,
   });
 };

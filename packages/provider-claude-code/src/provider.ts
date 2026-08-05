@@ -1,30 +1,47 @@
-import { ensureClaudeCodeAccessToken } from './access-token-cache.ts';
+import { ensureClaudeCodeAccessToken } from './access-token.ts';
 import { assertClaudeCodeUpstreamRecord } from './config.ts';
+import { CLAUDE_CODE_DEFAULT_FLAGS } from './defaults.ts';
 import { isClaudeCodeShapedRequest } from './detection.ts';
-import { detectHaikuProbe, callClaudeCodeMessages } from './fetch.ts';
-import { claudeCodeMessagesChain, type ClaudeCodeMessagesBoundaryCtx } from './interceptors/messages/index.ts';
-import { buildClaudeCodeCatalog, claudeCodeResolveRequestedModelId, fetchClaudeCodeModelsList } from './models.ts';
-import { pricingForClaudeCodeModelKey } from './pricing.ts';
+import { callClaudeCodeMessages } from './fetch.ts';
+import { CLAUDE_CODE_MESSAGES_BOUNDARY, type MessagesBoundaryCtx } from './interceptors/messages/index.ts';
+import { buildClaudeCodeCatalog, fetchClaudeCodeModelsList } from './models.ts';
 import { assertClaudeCodeUpstreamState } from './state.ts';
 import { runInterceptors } from '@floway-dev/interceptor';
 import type { MessagesStreamEvent } from '@floway-dev/protocols/messages';
 import {
-  defaultsForProvider,
   getProviderRepo,
+  headersForMessagesCall,
   resolveEffectiveFlags,
-  type ModelProvider,
-  type ModelProviderInstance,
+  type ProviderInstance,
+  type Provider,
   type ProviderStreamResult,
   type UpstreamRecord,
 } from '@floway-dev/provider';
 
-export const createClaudeCodeProvider = async (record: UpstreamRecord): Promise<ModelProviderInstance> => {
+// https://github.com/Wei-Shaw/sub2api/blob/4a5665da5b2c6b83c4597844ea6e573746c821b1/backend/internal/service/gateway_service.go#L421-L444
+const INBOUND_HEADER_ALLOWLIST = [
+  'accept',
+  /^x-stainless-(?:retry-count|timeout|lang|package-version|os|arch|runtime|runtime-version|helper-method)$/,
+  'anthropic-dangerous-direct-browser-access',
+  'anthropic-version',
+  'x-app',
+  'accept-language',
+  'sec-fetch-mode',
+  'user-agent',
+  'content-type',
+  'accept-encoding',
+  'x-claude-code-session-id',
+  'x-client-request-id',
+] as const;
+
+export const createClaudeCodeProvider = (record: UpstreamRecord): Provider => {
   assertClaudeCodeUpstreamRecord(record);
   assertClaudeCodeUpstreamState(record.state);
 
-  const enabledFlags = resolveEffectiveFlags(defaultsForProvider('claude-code'), [record.flagOverrides]);
+  const enabledFlags = resolveEffectiveFlags([CLAUDE_CODE_DEFAULT_FLAGS, record.flagOverrides]);
 
-  const provider: ModelProvider = {
+  const instance: ProviderInstance = {
+    callAlphaSearch: rejectUnsupported('callAlphaSearch'),
     // Catalog refresh mints an access token and hits /v1/models on every
     // dispatcher poll. `ensureClaudeCodeAccessToken` flips the row to
     // `refresh_failed` and throws `ClaudeCodeOAuthSessionTerminatedError`
@@ -40,32 +57,33 @@ export const createClaudeCodeProvider = async (record: UpstreamRecord): Promise<
       return buildClaudeCodeCatalog(apiModels, enabledFlags);
     },
 
-    getPricingForModelKey: pricingForClaudeCodeModelKey,
-
     callMessages: async (model, body, signal: AbortSignal | undefined, opts) => {
-      const ctx: ClaudeCodeMessagesBoundaryCtx = {
+      const ctx: MessagesBoundaryCtx = {
         payload: { ...body, model: model.id },
         model,
         upstreamId: record.id,
       };
 
-      // Detection runs on the inbound, unmodified payload + client headers.
+      // Detection runs on the unmodified payload plus the Claude Code
+      // fingerprint admitted by the provider module and Messages boundaries.
       // The re-mimicry chain would clobber operator-supplied `system` content
       // and overwrite the wire shape — exactly what a CC-shaped passthrough
       // needs to preserve. So the chain only runs on the unshaped path; the
-      // shaped path skips straight to the terminal call, which forwards the
-      // caller's headers and body byte-for-byte (Authorization swap only).
+      // shaped path skips straight to the terminal call, which preserves the
+      // caller's own system blocks, metadata and tool shape rather than
+      // re-deriving them. The call preserves that filtered fingerprint,
+      // supplies the provider-owned OAuth auth, and restamps the resolved model
+      // id.
       const looksShaped = isClaudeCodeShapedRequest({
-        headers: opts.headers,
+        headers: headersForMessagesCall(opts.headers, opts.anthropicBeta),
         body: ctx.payload,
-        isMaxTokensOneHaikuProbe: detectHaikuProbe(ctx.payload),
       });
 
       const terminal = async (): Promise<ProviderStreamResult<MessagesStreamEvent>> => {
         // Drop `model` from the payload: callClaudeCodeMessages re-attaches the
-        // dated upstream id (from `opts.model.providerData.upstreamModelId`)
-        // on the wire so Anthropic sees a stable per-revision id rather than
-        // the public alias the catalog exposes to clients.
+        // dated upstream id (from `opts.model.providerData.upstreamModelId`) on
+        // the wire so Anthropic sees a stable per-revision id rather than the
+        // public alias the catalog exposes to clients.
         const { model: _ignored, ...wireBody } = ctx.payload;
         return await callClaudeCodeMessages({
           upstreamId: record.id,
@@ -79,10 +97,10 @@ export const createClaudeCodeProvider = async (record: UpstreamRecord): Promise<
 
       if (looksShaped) return await terminal();
 
-      return await runInterceptors<ClaudeCodeMessagesBoundaryCtx, object, ProviderStreamResult<MessagesStreamEvent>>(
+      return await runInterceptors<MessagesBoundaryCtx, object, ProviderStreamResult<MessagesStreamEvent>>(
         ctx,
         {},
-        claudeCodeMessagesChain<ProviderStreamResult<MessagesStreamEvent>>(),
+        CLAUDE_CODE_MESSAGES_BOUNDARY,
         terminal,
       );
     },
@@ -90,22 +108,25 @@ export const createClaudeCodeProvider = async (record: UpstreamRecord): Promise<
     // Only /v1/messages is supported; reject any other endpoint loudly so a
     // dispatcher routing bug surfaces instead of a silent shape mismatch.
     callMessagesCountTokens: rejectUnsupported('callMessagesCountTokens'),
+    callCompletions: rejectUnsupported('callCompletions'),
     callChatCompletions: rejectUnsupported('callChatCompletions'),
     callResponses: rejectUnsupported('callResponses'),
-    callResponsesCompact: rejectUnsupported('callResponsesCompact'),
     callEmbeddings: rejectUnsupported('callEmbeddings'),
     callImagesGenerations: rejectUnsupported('callImagesGenerations'),
     callImagesEdits: rejectUnsupported('callImagesEdits'),
+    callAudioTranscriptions: rejectUnsupported('callAudioTranscriptions'),
+    callRerank: rejectUnsupported('callRerank'),
   };
 
   return {
-    upstream: record.id,
-    providerKind: 'claude-code',
+    upstreamId: record.id,
+    kind: 'claude-code',
     name: record.name,
+    inboundHeaderAllowlist: INBOUND_HEADER_ALLOWLIST,
     disabledPublicModelIds: record.disabledPublicModelIds,
-    provider,
-    supportsResponsesItemReference: false,
-    resolveRequestedModelId: claudeCodeResolveRequestedModelId,
+    modelPrefix: record.modelPrefix,
+    modelsCache: record.modelsCache,
+    instance,
   };
 };
 

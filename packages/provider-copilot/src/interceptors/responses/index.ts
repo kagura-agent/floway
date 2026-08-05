@@ -1,44 +1,32 @@
-// Copilot-only Responses workarounds. Each list is a boundary chain the
-// Copilot provider runs inside its own `callX` methods, so the gateway main
-// flow never knows that Copilot has Responses interceptors at all.
+// Copilot-only Responses workarounds. The chain is a boundary the Copilot
+// provider runs inside its own `callX` methods, so the gateway main flow
+// never knows that Copilot has Responses interceptors at all.
 
 import { withToolArgumentWhitespaceAborted } from './abort-on-tool-argument-whitespace.ts';
 import { withInlineImagesCompressed } from './compress-images.ts';
 import { withStoreForcedFalse } from './force-store-false.ts';
+import { withCopilotResponsesItemIdMembrane } from './item-id-membrane.ts';
 import { withInitiatorHeaderSet } from './set-initiator-header.ts';
 import { withVisionHeaderSet } from './set-vision-header.ts';
 import { withImageGenerationStripped } from './strip-image-generation.ts';
 import { withServiceTierStripped } from './strip-service-tier.ts';
-import { withOutputItemIdsSynchronized } from './synchronize-output-item-ids.ts';
-import type { CopilotResponsesBoundaryInterceptor, CopilotResponsesCompactBoundaryInterceptor } from './types.ts';
+import type { CopilotResponsesBoundaryInterceptor } from './types.ts';
 
-// Streaming `/responses` chain. Order matters: payload-mutating interceptors
-// run first so the header interceptors see the final outgoing payload, then
-// the header interceptors populate `ctx.headers` for the upstream call.
+// Single chain wraps both the streaming `/responses` call and the
+// non-streaming synth-via-trigger compaction call — the chain terminal
+// switches on `ctx.action` to pick the wire shape. Order matters:
+// payload-mutating interceptors run first so the header interceptors see
+// the final outgoing payload, then the header interceptors populate
+// `ctx.headers` for the upstream call. Result mutators sit between: the
+// whitespace guard acts only on generate streams, while the item-id membrane
+// also normalizes the generated item in compact value envelopes.
 export const COPILOT_RESPONSES_BOUNDARY = [
   withInlineImagesCompressed,
   withServiceTierStripped,
   withImageGenerationStripped,
   withStoreForcedFalse,
-  withOutputItemIdsSynchronized,
+  withCopilotResponsesItemIdMembrane,
   withToolArgumentWhitespaceAborted,
   withVisionHeaderSet,
   withInitiatorHeaderSet,
 ] as const satisfies readonly CopilotResponsesBoundaryInterceptor[];
-
-// Non-streaming `/responses/compact` chain. The compact terminal produces a
-// `response.compaction` envelope as a value, not a stream, so the two
-// event-stream mutators (`withToolArgumentWhitespaceAborted`,
-// `withOutputItemIdsSynchronized`) are omitted — they only inspect frames
-// after `run()` resolves. Every other Copilot-side payload/header workaround
-// applies identically: `/responses/compact` still rejects `store: true`,
-// still chokes on `image_generation` tools, still ignores `service_tier`,
-// and still wants the same vision / initiator headers when applicable.
-export const COPILOT_RESPONSES_COMPACT_BOUNDARY = [
-  withInlineImagesCompressed,
-  withServiceTierStripped,
-  withImageGenerationStripped,
-  withStoreForcedFalse,
-  withVisionHeaderSet,
-  withInitiatorHeaderSet,
-] as const satisfies readonly CopilotResponsesCompactBoundaryInterceptor[];

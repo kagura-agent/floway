@@ -1,8 +1,10 @@
+import type { MessagesUsage, MessagesUsageIteration, MessagesUsageServerToolUse } from './usage.ts';
+
 /**
  * Messages requires `max_tokens`, but the Chat Completions, Responses, and
  * Gemini sources may omit their output-token cap. When we translate one of
  * those sources to a Messages target, the data-plane prefers the model's
- * advertised `/models` output cap (`capabilities.maxOutputTokens`); this
+ * advertised `/models` output cap (`limits.max_output_tokens`); this
  * constant is the last-resort gateway policy default when both the source
  * payload and the model capability are silent.
  *
@@ -49,7 +51,13 @@ export interface MessagesPayload {
     // no `json_object` variant.
     format?: { type: 'json_schema'; schema: Record<string, unknown> };
   };
-  service_tier?: 'auto' | 'standard_only';
+  service_tier?: 'auto' | 'standard_only' | (string & {});
+  // https://docs.claude.com/en/build-with-claude/fast-mode — Fast Mode is
+  // opt-in per request. Beta-only on the upstream wire (gated by
+  // `anthropic-beta: fast-mode-2026-02-01`), but we expose the field at the
+  // protocol layer because the gateway treats `speed: 'fast'` as the canonical
+  // client signal regardless of which upstream serves it.
+  speed?: 'standard' | 'fast' | (string & {});
 }
 
 export interface MessagesSearchResultLocationCitation {
@@ -168,6 +176,48 @@ export interface MessagesRedactedThinkingBlock {
   data: string;
 }
 
+// Anthropic classifier refusal categories. The wire is versioned additively,
+// so retain the open-string arm for categories introduced after this snapshot.
+// https://github.com/anthropics/anthropic-sdk-typescript/blob/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/resources/messages/messages.ts#L1458-L1491
+export type MessagesRefusalCategory =
+  | 'cyber'
+  | 'bio'
+  | 'frontier_llm'
+  | 'reasoning_extraction'
+  | 'general_harms'
+  | (string & {})
+  | null;
+
+export interface MessagesRefusalStopDetails {
+  type: 'refusal';
+  category: MessagesRefusalCategory;
+  explanation: string | null;
+  fallback_credit_token?: string | null;
+  fallback_has_prefill_claim?: boolean | null;
+  recommended_model?: string | null;
+}
+
+// Server-side refusal fallback boundary. It is a regular content block with
+// no deltas and must survive assistant-history round trips in its original
+// position.
+// https://github.com/anthropics/anthropic-sdk-typescript/blob/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/resources/beta/messages/messages.ts#L1566-L1633
+export interface MessagesFallbackBlock {
+  type: 'fallback';
+  from: { model: string };
+  to: { model: string };
+  trigger: {
+    type: 'refusal';
+    category: MessagesRefusalCategory;
+  };
+}
+
+export interface MessagesFallbackBlockParam {
+  type: 'fallback';
+  from: { model: string };
+  to: { model: string };
+  trigger?: unknown;
+}
+
 export type MessagesUserContentBlock = MessagesTextBlock | MessagesImageBlock | MessagesToolResultBlock;
 
 export type MessagesAssistantContentBlock =
@@ -176,7 +226,12 @@ export type MessagesAssistantContentBlock =
   | MessagesServerToolUseBlock
   | MessagesWebSearchToolResultBlock
   | MessagesThinkingBlock
-  | MessagesRedactedThinkingBlock;
+  | MessagesRedactedThinkingBlock
+  | MessagesFallbackBlock;
+
+export type MessagesAssistantInputContentBlock =
+  | Exclude<MessagesAssistantContentBlock, MessagesFallbackBlock>
+  | MessagesFallbackBlockParam;
 
 export interface MessagesUserMessage {
   role: 'user';
@@ -185,7 +240,7 @@ export interface MessagesUserMessage {
 
 export interface MessagesAssistantMessage {
   role: 'assistant';
-  content: string | MessagesAssistantContentBlock[];
+  content: string | MessagesAssistantInputContentBlock[];
 }
 
 // The Anthropic Messages API role enum is "user" | "assistant" | "system"
@@ -226,29 +281,16 @@ export interface MessagesNativeWebSearchTool {
 
 export type MessagesTool = MessagesClientTool | MessagesNativeWebSearchTool;
 
-export interface MessagesUsageServerToolUse {
-  web_search_requests?: number;
-}
-
-export interface MessagesUsage {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
-  // Per-TTL split for cache writes introduced by extended-cache-ttl-2025-04-11.
-  // Each `ephemeral_*` field is a disjoint subset of `cache_creation_input_tokens`
-  // (the legacy flat field is the sum of both); upstreams that have not opted
-  // into the beta omit `cache_creation` entirely and emit only the flat field.
-  cache_creation?: {
-    ephemeral_5m_input_tokens?: number;
-    ephemeral_1h_input_tokens?: number;
-  };
-  // https://docs.claude.com/en/api/service-tiers
-  service_tier?: 'standard' | 'priority' | 'batch' | (string & {});
-  // https://docs.claude.com/en/build-with-claude/fast-mode
-  speed?: 'standard' | 'fast' | (string & {});
-  server_tool_use?: MessagesUsageServerToolUse;
-}
+export {
+  mergeMessagesUsageSnapshot,
+  messagesUsageSnapshot,
+  splitMessagesCacheCreationTokens,
+  type MessagesCacheCreationUsage,
+  type MessagesUsage,
+  type MessagesUsageIteration,
+  type MessagesUsageServerToolUse,
+  type MessagesUsageSnapshot,
+} from './usage.ts';
 
 export interface MessagesResult {
   id: string;
@@ -257,6 +299,7 @@ export interface MessagesResult {
   content: MessagesAssistantContentBlock[];
   model: string;
   stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | 'pause_turn' | 'refusal' | null;
+  stop_details?: MessagesRefusalStopDetails | null;
   stop_sequence: string | null;
   usage: MessagesUsage;
 }
@@ -291,7 +334,8 @@ export interface MessagesContentBlockStartEvent {
     | MessagesServerToolUseBlock
     | MessagesWebSearchToolResultBlock
     | { type: 'thinking'; thinking: string }
-    | { type: 'redacted_thinking'; data: string };
+    | { type: 'redacted_thinking'; data: string }
+    | MessagesFallbackBlock;
 }
 
 export interface MessagesContentBlockDeltaEvent {
@@ -314,6 +358,7 @@ export interface MessagesMessageDeltaEvent {
   type: 'message_delta';
   delta: {
     stop_reason?: MessagesResult['stop_reason'];
+    stop_details?: MessagesRefusalStopDetails | null;
     stop_sequence?: string | null;
   };
   usage?: {
@@ -325,9 +370,11 @@ export interface MessagesMessageDeltaEvent {
       ephemeral_5m_input_tokens?: number;
       ephemeral_1h_input_tokens?: number;
     };
+    output_tokens_details?: { thinking_tokens: number };
     service_tier?: 'standard' | 'priority' | 'batch' | (string & {});
     speed?: 'standard' | 'fast' | (string & {});
     server_tool_use?: MessagesUsageServerToolUse;
+    iterations?: MessagesUsageIteration[] | null;
   };
 }
 
@@ -359,3 +406,8 @@ export { parseMessagesStream, type ParseMessagesStreamOptions } from './stream.t
 // extra guard.
 export const parseAnthropicBetaHeader = (raw: string | null | undefined): readonly string[] =>
   raw ? raw.split(',').map(part => part.trim()).filter(part => part.length > 0) : [];
+
+export { MESSAGES_MISSING_TERMINAL_MESSAGE, collectMessagesProtocolEventsToResult } from './to-result.ts';
+export { reassembleMessagesEvents } from './reassemble.ts';
+export { messagesProtocolFrameToSSEFrame } from './to-sse.ts';
+export { PROMPT_TOO_LONG_MESSAGE, buildPromptTooLongBody } from './context-window-error.ts';

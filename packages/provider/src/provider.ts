@@ -1,41 +1,57 @@
-import type { InternalModel, UpstreamModel, UpstreamProviderKind } from './model.ts';
+import type { AudioTranscriptionRequest } from './audio.ts';
+import type { FlagDefaults } from './flags.ts';
+import type { ImagesEditsRequest } from './images.ts';
+import type { ModelPrefixConfig } from './model-prefix.ts';
+import type { ProviderModel, UpstreamModelsCache, UpstreamProviderKind, UpstreamRecord } from './model.ts';
 import type { Fetcher } from './options.ts';
 import type { ChatCompletionsPayload, ChatCompletionsStreamEvent } from '@floway-dev/protocols/chat-completions';
-import type { ModelEndpoints, ModelPricing, ProtocolFrame } from '@floway-dev/protocols/common';
+import type { ProtocolFrame, RerankTarget } from '@floway-dev/protocols/common';
+import type { CompletionsPayload } from '@floway-dev/protocols/completions';
 import type { EmbeddingsPayload } from '@floway-dev/protocols/embeddings';
 import type { ImagesGenerationsPayload } from '@floway-dev/protocols/images';
 import type { MessagesPayload, MessagesStreamEvent } from '@floway-dev/protocols/messages';
-import type { ResponsesCompactPayload, ResponsesPayload, ResponsesResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import type { CanonicalRerankRequest } from '@floway-dev/protocols/rerank';
+import type { CanonicalResponsesPayload, ResponsesCompactionResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 
-export interface ProviderModelRecord {
-  upstream: string;
-  upstreamName: string;
-  providerKind: UpstreamProviderKind;
-  provider: ModelProvider;
-  upstreamModel: UpstreamModel;
-  enabledFlags: ReadonlySet<string>;
-  supportsResponsesItemReference: boolean;
-}
+// Action tag threaded through the Responses pipeline. `generate` is a normal
+// streaming /responses turn; `compact` is the summarize-and-replace-history
+// turn that some upstreams expose natively (`/v1/responses/compact`,
+// chatgpt.com's RemoteCompactionV2 over /codex/responses) and others have to
+// simulate. The same `callResponses` method dispatches on this tag, and
+// interceptors are free to flip it (the responses-compact-shim turns 'compact'
+// into 'generate' so the inner upstream call runs an ordinary summarization
+// turn against the SUMMARIZATION_PROMPT).
+export type ResponsesAction = 'generate' | 'compact';
 
-export interface ResolvedModel extends InternalModel {
-  endpoints: ModelEndpoints;
-  providers: readonly ProviderModelRecord[];
-}
+export type InboundHeaderMatcher = string | RegExp;
 
-export interface ModelProviderInstance {
-  upstream: string;
-  providerKind: UpstreamProviderKind;
+export interface Provider {
+  upstreamId: string;
+  kind: UpstreamProviderKind;
   name: string;
-  // Public model ids the operator switched off for this upstream.
+  // Client-authored headers this instance can consume. Strings are exact,
+  // ASCII-case-insensitive names; regular expressions run against normalized
+  // lowercase names. The gateway applies this at the candidate boundary.
+  inboundHeaderAllowlist: readonly InboundHeaderMatcher[];
   disabledPublicModelIds: readonly string[];
-  provider: ModelProvider;
-  supportsResponsesItemReference: boolean;
-  resolveRequestedModelId?(modelId: string): string | undefined;
+  // Per-upstream model name prefix policy mirrored from the source upstream
+  // record so registry helpers — routing and listing — read it from the
+  // instance instead of re-fetching the row. `null` keeps the bare-id behavior.
+  modelPrefix: ModelPrefixConfig | null;
+  // The row's cached catalog, mirrored for the same reason: the SWR layer
+  // reads it from the instance instead of paying a second round trip that the
+  // row read already covered.
+  modelsCache: UpstreamModelsCache | null;
+  instance: ProviderInstance;
 }
 
 export interface ProviderCallResult {
   response: Response;
   modelKey: string;
+}
+
+export interface ProviderRerankCallResult extends ProviderCallResult {
+  target: RerankTarget;
 }
 
 // Streaming endpoints (Messages / Responses / ChatCompletions) return decoded
@@ -54,31 +70,29 @@ export type ProviderStreamResult<TEvent> =
   | { ok: true; events: AsyncIterable<ProtocolFrame<TEvent>>; modelKey: string; headers?: Headers }
   | { ok: false; response: Response; modelKey: string };
 
-// `/responses/compact` is non-streaming — the upstream returns a single
+// `action: 'generate'` is a normal streaming /responses turn — its frames
+// flow through the per-frame event stream like every other streaming endpoint.
+// `action: 'compact'` is non-streaming — the upstream returns a single
 // `response.compaction` envelope. Some upstreams expose a native compaction
-// endpoint and produce the envelope directly; others synthesize the
-// envelope from a regular `/responses` turn — both return the typed value
-// rather than a re-parsed synthesized SSE body. An upstream failure
-// carries the raw Response so the boundary reports it verbatim.
-export type ProviderCompactionResult =
-  | { ok: true; result: ResponsesResult; modelKey: string }
-  | { ok: false; response: Response; modelKey: string };
+// endpoint and produce the envelope directly; others synthesize the envelope
+// from a regular /responses turn — both return the typed value rather than a
+// re-parsed synthesized SSE body. The discriminated result tags which branch
+// actually ran so the gateway's shape-lowering can pick between the streaming
+// and value-envelope arms; snapshot mode itself reads `invocation.action` (the
+// post-chain caller intent), not the result tag.
+// The `ok: false` contract is identical to ProviderStreamResult above.
+export type ProviderResponsesResult =
+  | { action: 'generate'; ok: true; events: AsyncIterable<ProtocolFrame<ResponsesStreamEvent>>; modelKey: string; headers?: Headers }
+  | { action: 'generate'; ok: false; response: Response; modelKey: string }
+  | { action: 'compact'; ok: true; result: ResponsesCompactionResult; modelKey: string }
+  | { action: 'compact'; ok: false; response: Response; modelKey: string };
 
-// Per-call observation hooks the gateway threads through to the provider.
+// Per-call options the gateway threads through to the provider.
 //
 // `fetcher` is the per-upstream proxy-aware indirection for outbound HTTP.
 // Every upstream call (data-plane request, OAuth refresh, etc.) must go
 // through this fetcher so a single fallback chain governs every leg of the
 // call under restricted egress.
-//
-// `recordUpstreamLatency` measures the precise upstream round-trip — request
-// leaves the gateway, response returns to the gateway — and explicitly excludes
-// in-process work the provider does around the call (boundary interceptors,
-// auth-token refresh, request/response shaping, SSE parsing). The provider is
-// required to wrap the actual upstream fetch promise with this helper at least
-// once; the gateway throws on a violation so missing wraps fail loud. On
-// retries (e.g. invalidate-token-and-redo), only the most recent invocation's
-// measurement is kept.
 //
 // `waitUntil` registers a fire-and-forget promise that must outlive the
 // response. On workerd it maps to `ExecutionContext.waitUntil` so the
@@ -86,44 +100,74 @@ export type ProviderCompactionResult =
 // no-op. Providers use it for post-response persistence the caller has
 // already stopped waiting on.
 //
-// `headers` is the single inbound-headers conduit from gateway to provider.
-// The gateway seeds it from the source request's headers. Providers with no
-// boundary scrubbing (Azure, custom) thread `opts.headers` straight to the
-// upstream wire; providers that scrub (Copilot, Codex) clone via
-// `new Headers(opts.headers)` into the boundary ctx so their interceptor
-// chain mutates the clone instead of the caller's bag. The gateway owns
-// the bag and the provider must not retain a reference past the call.
+// `headers` is the ordinary inbound-headers conduit from gateway to provider.
+// The gateway filters the source request through the selected provider
+// instance's `inboundHeaderAllowlist` before constructing this bag. Protocol-owned
+// metadata is carried by its owning invocation boundary and does not widen
+// this provider-level policy. A provider may clone and mutate the bag for
+// request-specific wire shaping, but must not retain the gateway-owned
+// reference past the call.
 export interface UpstreamCallOptions {
   fetcher: Fetcher;
-  recordUpstreamLatency: <T>(promise: Promise<T>) => Promise<T>;
   waitUntil: (promise: Promise<unknown>) => void;
   headers: Headers;
+  // Providers wrap the dispatch that fires the outbound fetch. The wrap
+  // runs synchronously and stamps `attempt.upstreamCallStartedAt` before
+  // invoking the factory, so the stamp fires ahead of dial + TLS + CONNECT
+  // (which live inside the returned promise's async body under a proxied
+  // fetcher). The interval anchored here therefore includes the gateway's
+  // own egress work — proxy-backoff lookup, dial, TLS, CONNECT — and
+  // excludes everything the gateway does before dispatch (routing,
+  // translation, interceptor entry). Candidate iteration clears the anchors
+  // per candidate, so after a failover the recorded interval is shorter
+  // than the latency the client observed.
+  wrapUpstreamCall: <T>(dispatch: () => Promise<T>) => Promise<T>;
 }
 
-export interface ModelProvider {
+export interface MessagesUpstreamCallOptions extends UpstreamCallOptions {
+  // Messages transport metadata has a typed path so it cannot be admitted by
+  // an ordinary provider header allowlist or leak from another source
+  // protocol that happens to send the same HTTP field name.
+  readonly anthropicBeta: readonly string[];
+}
+
+export interface ProviderInstance {
   // Catalog refresh fetches a single resource and never enters the per-request
   // latency budget, so it takes the per-upstream fetcher directly instead of
   // the broader `UpstreamCallOptions` bag the data-plane `call*` methods use.
-  getProvidedModels(fetcher: Fetcher): Promise<readonly UpstreamModel[]>;
-  // Resolve pricing for a usage record's `model_key` (the raw upstream model id).
-  getPricingForModelKey(modelKey: string): ModelPricing | null;
-  // Same `opts.headers` shape across every protocol so provider impls never
-  // branch on the protocol when reading inbound headers. `anthropic-beta`
-  // lives on `opts.headers` like any other header; providers that need the
-  // parsed slice for variant selection (Copilot picks a raw upstream variant
-  // before the wire header is filtered down to the Copilot allow-list)
-  // re-parse it from `opts.headers.get('anthropic-beta')` themselves.
-  callChatCompletions(model: UpstreamModel, body: Omit<ChatCompletionsPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderStreamResult<ChatCompletionsStreamEvent>>;
-  callResponses(model: UpstreamModel, body: Omit<ResponsesPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderStreamResult<ResponsesStreamEvent>>;
-  callResponsesCompact(model: UpstreamModel, body: Omit<ResponsesCompactPayload, 'model' | 'store'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCompactionResult>;
-  callMessages(model: UpstreamModel, body: Omit<MessagesPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderStreamResult<MessagesStreamEvent>>;
+  getProvidedModels(fetcher: Fetcher): Promise<readonly ProviderModel[]>;
+  callAlphaSearch(model: ProviderModel, body: Record<string, unknown>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
+  // /v1/completions text completions. Passthrough. Providers whose
+  // upstream doesn't expose /v1/completions set `endpoints.completions`
+  // to absent in getProvidedModels, so this method is unreachable for
+  // those upstreams; the rejecting stubs in those providers are pure
+  // defense-in-depth.
+  callCompletions(model: ProviderModel, body: Omit<CompletionsPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
+  callChatCompletions(model: ProviderModel, body: Omit<ChatCompletionsPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderStreamResult<ChatCompletionsStreamEvent>>;
+  callResponses(model: ProviderModel, body: Omit<CanonicalResponsesPayload, 'model'>, action: ResponsesAction, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderResponsesResult>;
+  callMessages(model: ProviderModel, body: Omit<MessagesPayload, 'model'>, signal: AbortSignal | undefined, opts: MessagesUpstreamCallOptions): Promise<ProviderStreamResult<MessagesStreamEvent>>;
   // count_tokens is non-streaming JSON; the gateway relays the upstream
   // Response verbatim.
-  callMessagesCountTokens(model: UpstreamModel, body: Omit<MessagesPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
-  callEmbeddings(model: UpstreamModel, body: Omit<EmbeddingsPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
-  callImagesGenerations(model: UpstreamModel, body: Omit<ImagesGenerationsPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
-  // The provider takes ownership of `body` and may mutate it (e.g. append
-  // the upstream-specific model/deployment id). Callers must allocate a
-  // fresh FormData per call.
-  callImagesEdits(model: UpstreamModel, body: FormData, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
+  callMessagesCountTokens(model: ProviderModel, body: Omit<MessagesPayload, 'model'>, signal: AbortSignal | undefined, opts: MessagesUpstreamCallOptions): Promise<ProviderCallResult>;
+  callEmbeddings(model: ProviderModel, body: Omit<EmbeddingsPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
+  callImagesGenerations(model: ProviderModel, body: Omit<ImagesGenerationsPayload, 'model'>, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
+  callImagesEdits(model: ProviderModel, request: ImagesEditsRequest, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
+  callAudioTranscriptions(model: ProviderModel, request: AudioTranscriptionRequest, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderCallResult>;
+  callRerank(model: ProviderModel, request: CanonicalRerankRequest, signal: AbortSignal | undefined, opts: UpstreamCallOptions): Promise<ProviderRerankCallResult>;
+}
+
+// Static, module-shaped surface each provider package exports. The gateway
+// registry keeps a Record<UpstreamProviderKind, ProviderModule> so every
+// kind→X dispatch (instance construction, flag defaults) reads its answer
+// off the same object. Adding a new dispatch slot means a field here, not
+// a parallel per-kind map.
+export interface ProviderModule {
+  // Instance factory: capture the record and return closures. Sync — any
+  // I/O the provider needs (token refresh, state persistence, catalog
+  // fetch) happens on demand inside the per-request methods on the
+  // returned ProviderInstance.
+  create: (record: UpstreamRecord) => Provider;
+  // Exhaustive default map over every catalog flag id for a fresh
+  // upstream of this kind; see each provider package's `defaults.ts`.
+  defaultFlags: FlagDefaults;
 }

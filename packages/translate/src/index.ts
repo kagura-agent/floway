@@ -8,4 +8,6 @@ export { translateGeminiViaMessages } from './gemini-via-messages/translate.ts';
 export { translateGeminiViaResponses } from './gemini-via-responses/translate.ts';
 export { translateGeminiViaChatCompletions } from './gemini-via-chat-completions/translate.ts';
 
-export type { TranslationContext } from './types.ts';
+export { canonicalizeResponsesPayload } from './canonicalize-responses-payload.ts';
+export type { RemoteImageData, RemoteImageLoader, TranslatedApiError, TranslateTripResult, TranslationContext } from './types.ts';
+export { TranslatorInputError } from './translator-input-error.ts';

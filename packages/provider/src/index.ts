@@ -1,57 +1,72 @@
 export type {
   ChatCompletionsInvocation,
   GeminiInvocation,
-  LlmTargetApi,
+  ChatTargetApi,
   MessagesInvocation,
-  ProviderCandidate,
+  ModelCandidate,
   ResponsesInvocation,
 } from './invocation.ts';
+export { providerModelOf } from './invocation.ts';
 
 export type { InternalDebugError } from './error.ts';
 export { toInternalDebugError } from './error.ts';
 
 export type {
+  ApiErrorResult,
   EventResult,
   EventResultMetadata,
   ExecuteResult,
   InternalErrorResult,
   PlainResult,
-  UpstreamErrorResult,
 } from './result.ts';
 export {
-  decodeUpstreamErrorBody,
+  apiErrorToResponse,
+  decodeApiErrorBody,
   eventResult,
   internalErrorResult,
   plainResult,
-  readUpstreamError,
-  upstreamErrorToResponse,
+  readUpstreamApiError,
 } from './result.ts';
 
 export type {
+  InternalAliasedFrom,
   InternalModel,
-  PerformanceTelemetryContext,
+  ProviderModel,
   ProxyFallbackEntry,
-  TelemetryModelIdentity,
-  UpstreamModel,
+  UpstreamModelsCache,
   UpstreamProviderKind,
   UpstreamRecord,
 } from './model.ts';
-export { ALL_PROVIDER_KINDS } from './model.ts';
+export { ALL_PROVIDER_KINDS, assertUpstreamProviderKind, normalizeUpstreamHue, UPSTREAM_HUE_DEGREES } from './model.ts';
+export type { PerformanceOperation, PerformanceTelemetryContext, TelemetryModelIdentity } from './telemetry.ts';
+export { parsePerformanceOperation, PERFORMANCE_OPERATIONS } from './telemetry.ts';
+
+export type { AddressableForm, ModelPrefixConfig } from './model-prefix.ts';
+export { MODEL_PREFIX_MAX_LENGTH, MODEL_PREFIX_REGEX, normalizeModelPrefix } from './model-prefix.ts';
 
 export type {
-  ModelProvider,
-  ModelProviderInstance,
+  Provider,
+  InboundHeaderMatcher,
+  ProviderInstance,
   ProviderCallResult,
-  ProviderCompactionResult,
-  ProviderModelRecord,
+  ProviderRerankCallResult,
+  ProviderModule,
+  MessagesUpstreamCallOptions,
+  ProviderResponsesResult,
   ProviderStreamResult,
-  ResolvedModel,
+  ResponsesAction,
   UpstreamCallOptions,
 } from './provider.ts';
-export { streamingProviderCall, type ProviderStreamParser } from './streaming.ts';
+export { headersForMessagesCall } from './messages.ts';
+export type { ImagesEditsRequest, ImagesEditsSource } from './images.ts';
+export { serializeOpenAIImagesEditsRequest } from './images.ts';
+export type { AudioTranscriptionFormEntry, AudioTranscriptionRequest } from './audio.ts';
+export { serializeModelPathAudioTranscriptionRequest, serializeOpenAIAudioTranscriptionRequest } from './audio.ts';
+export type { ProviderStreamParser } from './streaming.ts';
+export { streamingProviderCall } from './streaming.ts';
 
 export type { ProviderRepo, UpstreamsRepoSlim } from './repo.ts';
-export { getProviderRepo, initProviderRepo } from './repo.ts';
+export { getProviderRepo, initProviderRepo, UpstreamGoneError } from './repo.ts';
 
 export {
   ProviderModelsUnavailableError,
@@ -59,30 +74,24 @@ export {
   httpResponseToResponse,
 } from './models-fetch.ts';
 
-export type { Flag, FlagOverrides, OptionalFlagId } from './flags.ts';
+export type { FlagDefaults, FlagId, FlagOverrides } from './flags.ts';
 export {
-  OPTIONAL_FLAGS,
-  defaultsForProvider,
-  getFlagCatalog,
-  isKnownFlagId,
+  OPTIONAL_FLAG_IDS,
   parseFlagOverridesWire,
   resolveEffectiveFlags,
 } from './flags.ts';
 
 export type {
   UpstreamModelConfig,
-  UpstreamModelFlagOverrides,
-  UpstreamModelLimits,
+  UpstreamChatModelConfig,
 } from './model-config.ts';
 export {
+  chatField,
   endpointsField,
-  flagOverridesField,
   isRecord,
-  limitsField,
   modelsField,
   nonEmptyStringField,
   optionalStringField,
-  pricingField,
   publicModelId,
 } from './model-config.ts';
 
@@ -90,14 +99,13 @@ export type { ValidatePathErr, ValidatePathOk } from './join.ts';
 export { joinBaseAndPath, validateUpstreamPath } from './join.ts';
 
 export type { Fetcher, UpstreamFetchOptions } from './options.ts';
-export { directFetcher } from './options.ts';
+export { directFetcher, dispatchUpstreamFetch, identityWrapUpstreamCall } from './options.ts';
 
 export { isAbortError } from './abort.ts';
 
 export {
+  base64ToBytes,
+  bytesToBase64,
   isBase64ImageDataUrl,
-  memoizedBase64Compressor,
-  memoizedDataUrlCompressor,
+  parseBase64ImageDataUrl,
 } from './image-helpers.ts';
-
-export { COMPACTION_TRIGGER, compactionResponse } from './compaction.ts';

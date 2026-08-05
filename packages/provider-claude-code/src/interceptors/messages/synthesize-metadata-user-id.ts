@@ -1,7 +1,8 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
+import { v4 } from 'uuid';
 
-import type { ClaudeCodeMessagesBoundaryCtx } from './types.ts';
+import type { MessagesBoundaryCtx } from './types.ts';
 import type { MessagesMessage, MessagesPayload } from '@floway-dev/protocols/messages';
 
 // Real CC includes `metadata.user_id` on every /v1/messages request: a JSON
@@ -28,8 +29,8 @@ import type { MessagesMessage, MessagesPayload } from '@floway-dev/protocols/mes
 //   - https://github.com/Wei-Shaw/sub2api/blob/4a5665da5b2c6b83c4597844ea6e573746c821b1/backend/internal/service/metadata_userid.go#L15
 
 export const synthesizeMetadataUserId = async <TResult>(
-  ctx: ClaudeCodeMessagesBoundaryCtx,
-  _request: object,
+  ctx: MessagesBoundaryCtx,
+  _env: object,
   run: () => Promise<TResult>,
 ): Promise<TResult> => {
   const existing = ctx.payload.metadata?.user_id;
@@ -51,9 +52,9 @@ const deviceIdForUpstream = (upstreamId: string): string =>
 // Session id derives from the upstream id plus the first user message text,
 // so multi-turn conversations of the same conversation prefix re-use the
 // same session id (good for prompt cache) but different conversations get
-// different ids. Matches the strategy injectSessionId uses on the Codex
-// side, with a per-upstream salt so two upstreams running the same script
-// don't collide.
+// different ids. Mirrors the strategy the Codex provider uses for its own
+// session-id derivation, with a per-upstream salt so two upstreams running
+// the same script don't collide.
 const sessionIdForPayload = (upstreamId: string, payload: Pick<MessagesPayload, 'messages'>): string => {
   const firstUser = firstUserMessageText(payload.messages);
   return sha256Uuidv4(`claude-code-session:${upstreamId}${firstUser}`);
@@ -73,11 +74,6 @@ const firstUserMessageText = (messages: MessagesMessage[]): string => {
 
 const sha256Hex = (input: string): string => bytesToHex(sha256(new TextEncoder().encode(input)));
 
-// Same UUIDv4 stamping trick injectSessionId uses on the Codex side: stamp
-// the sha256 hex with the version-4 nibble inline and overwrite the variant
-// nibble so the output validates as a real UUIDv4.
 const sha256Uuidv4 = (input: string): string => {
-  const hex = sha256Hex(input);
-  const variantNibble = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-${variantNibble}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+  return v4({ random: sha256(new TextEncoder().encode(input)) });
 };

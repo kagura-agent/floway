@@ -1,10 +1,10 @@
 import type { ResponsesBoundaryCtx } from './types.ts';
-import type { ResponsesPayload, ResponsesTool, ResponsesToolChoice } from '@floway-dev/protocols/responses';
+import type { CanonicalResponsesPayload, ResponsesTool, ResponsesToolChoice } from '@floway-dev/protocols/responses';
 
 /**
  * Copilot's `/responses` endpoint rejects public `image_generation` tool
  * entries, so strip them once the planner has committed to a native Responses
- * target on a Copilot binding. Other Responses-capable upstreams (e.g. OpenAI
+ * target on a Copilot upstream. Other Responses-capable upstreams (e.g. OpenAI
  * direct) accept the entry and must continue to see it. Other public hosted
  * and deferred tools (`web_search`, `tool_search`, `namespace`) are left in
  * place: Codex relies on `tool_search` / `namespace` for client-executed
@@ -17,10 +17,10 @@ import type { ResponsesPayload, ResponsesTool, ResponsesToolChoice } from '@flow
  */
 const isImageGenerationTool = (tool: ResponsesTool): boolean => tool.type === 'image_generation';
 
-const isImageGenerationToolChoice = (choice: ResponsesToolChoice | undefined): boolean =>
-  typeof choice === 'object' && choice !== null && (choice as { type?: unknown }).type === 'image_generation';
+const isImageGenerationToolChoice = (choice: ResponsesToolChoice | null | undefined): boolean =>
+  typeof choice === 'object' && choice !== null && choice.type === 'image_generation';
 
-export const stripImageGenerationFromPayload = (payload: ResponsesPayload): void => {
+export const stripImageGenerationFromPayload = (payload: CanonicalResponsesPayload): void => {
   let removedTool = false;
 
   if (Array.isArray(payload.tools)) {
@@ -51,7 +51,7 @@ export const stripImageGenerationFromPayload = (payload: ResponsesPayload): void
 
 export const withImageGenerationStripped = async <TResult>(
   ctx: ResponsesBoundaryCtx,
-  _request: object,
+  _env: object,
   run: () => Promise<TResult>,
 ): Promise<TResult> => {
   stripImageGenerationFromPayload(ctx.payload);

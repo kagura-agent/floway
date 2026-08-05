@@ -1,85 +1,43 @@
-import { ensureClaudeCodeAccessToken, invalidateClaudeCodeAccessToken, type EnsuredAccessToken } from './access-token-cache.ts';
+import { ensureClaudeCodeAccessToken, invalidateClaudeCodeAccessToken, type EnsuredAccessToken } from './access-token.ts';
 import { ClaudeCodeOAuthSessionTerminatedError } from './auth/oauth.ts';
 import { pickClaudeCodeHeaders } from './headers.ts';
 import { logWarn, logInfo } from './log.ts';
+import type { ClaudeCodeProviderData } from './models.ts';
 import { parseClaudeCodeQuotaHeaders, type ClaudeCodeQuotaSnapshot } from './quota.ts';
 import {
   readClaudeCodeUpstreamState,
   replaceSoleAccount,
+  type ClaudeCodeAccountCredential,
 } from './state.ts';
-import type { ClaudeCodeProviderData } from './types.ts';
 import type { MessagesPayload, MessagesStreamEvent } from '@floway-dev/protocols/messages';
 import { parseMessagesStream } from '@floway-dev/protocols/messages';
 import {
   getProviderRepo,
+  headersForMessagesCall,
   streamingProviderCall,
+  type MessagesUpstreamCallOptions,
+  type ProviderModel,
   type ProviderStreamResult,
-  type UpstreamCallOptions,
-  type UpstreamModel,
 } from '@floway-dev/provider';
 
 const ANTHROPIC_MESSAGES_ENDPOINT = 'https://api.anthropic.com/v1/messages?beta=true';
 
-// Detection helper: the periodic CC connectivity probe sends `max_tokens: 1`
-// against a haiku id (model name substring 'haiku') and never carries a
-// system block. Surfacing those as CC-shaped lets them pass through without
-// re-mimicry overhead, matching real CC's wire shape exactly.
-export const detectHaikuProbe = (body: { model?: unknown; max_tokens?: unknown }): boolean => {
-  return typeof body.model === 'string'
-    && body.model.includes('haiku')
-    && body.max_tokens === 1;
-};
-
 export interface CallClaudeCodeMessagesOptions {
   upstreamId: string;
-  model: UpstreamModel;
+  model: ProviderModel;
   body: Omit<MessagesPayload, 'model'>;
   // `shaped: true` means the inbound request already looks like real CC
-  // traffic (operator's CC client sent through verbatim). The wire header
-  // surface is rebuilt from `opts.call.headers` through a tight
-  // whitelist that matches sub2api's `allowedHeaders`
-  // (gateway_service.go:422-444), preserving the operator's genuine
-  // X-Stainless-* / anthropic-beta / x-claude-code-session-id fingerprint
-  // end-to-end. Only Authorization is swapped for our cached OAuth token.
+  // traffic. The gateway has reduced ordinary headers to the provider module's
+  // allowlist and carries anthropic-beta as typed Messages metadata, so the
+  // wire path preserves the complete genuine fingerprint. It supplies a
+  // default Content-Type when absent and sets cached OAuth auth.
   // `shaped: false` means the gateway's re-mimicry chain rebuilt the
   // payload's system blocks / metadata / model id — replace headers with
   // the pinned CC set so the wire shape matches end-to-end.
   shaped: boolean;
   signal?: AbortSignal;
-  call: UpstreamCallOptions;
+  call: MessagesUpstreamCallOptions;
 }
-
-// Sub2api's `allowedHeaders` allowlist verbatim
-// (gateway_service.go:422-444). On the shaped passthrough path we only
-// forward inbound headers whose lowercased name appears here; everything
-// else (e.g. ad-hoc debug headers, `host`, `cookie`) is dropped before
-// hitting Anthropic. `authorization` is intentionally excluded — we set
-// our own from the cached OAuth token. `content-type` is forwarded when
-// the inbound carries one; the call site defaults it to
-// `application/json` otherwise.
-const SHAPED_PASSTHROUGH_HEADER_ALLOWLIST = new Set<string>([
-  'accept',
-  'x-stainless-retry-count',
-  'x-stainless-timeout',
-  'x-stainless-lang',
-  'x-stainless-package-version',
-  'x-stainless-os',
-  'x-stainless-arch',
-  'x-stainless-runtime',
-  'x-stainless-runtime-version',
-  'x-stainless-helper-method',
-  'anthropic-dangerous-direct-browser-access',
-  'anthropic-version',
-  'x-app',
-  'anthropic-beta',
-  'accept-language',
-  'sec-fetch-mode',
-  'user-agent',
-  'content-type',
-  'accept-encoding',
-  'x-claude-code-session-id',
-  'x-client-request-id',
-]);
 
 const synthetic503 = (message: string): Response =>
   new Response(
@@ -132,16 +90,23 @@ const isRateLimitedNow = (
 };
 
 const persistQuotaSnapshot = async (upstreamId: string, snapshot: ClaudeCodeQuotaSnapshot): Promise<void> => {
-  const fresh = await getProviderRepo().upstreams.getById(upstreamId);
-  if (!fresh) throw new Error(`Claude Code upstream ${upstreamId} disappeared mid-request`);
-  const state = readClaudeCodeUpstreamState(fresh.state);
-  const account = state.accounts[0];
-  const priorStatus = account.quotaSnapshot === null ? null : account.quotaSnapshot.data.status;
-  const next = replaceSoleAccount(state, account => ({
-    ...account,
-    quotaSnapshot: { fetchedAt: Date.now(), data: snapshot },
-  }));
-  await getProviderRepo().upstreams.saveState(upstreamId, next, { expectedState: fresh.state });
+  // Stamped before the write: the mutator is replayed on a lost race and must
+  // return the same document each time, and this records when the snapshot was
+  // observed rather than which attempt landed it.
+  const fetchedAt = Date.now();
+  // The prior status comes from the state the mutator was handed: the write is
+  // retried against whoever won the row, so only that view describes the
+  // snapshot this write actually replaced.
+  let previousAccount!: ClaudeCodeAccountCredential;
+  await getProviderRepo().upstreams.saveState(upstreamId, current => {
+    const state = readClaudeCodeUpstreamState(current);
+    previousAccount = state.accounts[0];
+    return replaceSoleAccount(state, account => ({
+      ...account,
+      quotaSnapshot: { fetchedAt, data: snapshot },
+    }));
+  });
+  const priorStatus = previousAccount.quotaSnapshot === null ? null : previousAccount.quotaSnapshot.data.status;
   // Emit only on transition. Persisting every response would flood the log
   // with one event per request; the dashboard already reads the snapshot
   // verbatim. Operators care about the moment the upstream flipped from
@@ -149,7 +114,7 @@ const persistQuotaSnapshot = async (upstreamId: string, snapshot: ClaudeCodeQuot
   if (priorStatus !== snapshot.status) {
     logInfo('claude_code_quota_state_transition', {
       upstream_id: upstreamId,
-      account_uuid: account.accountUuid,
+      account_uuid: previousAccount.accountUuid,
       from_status: priorStatus,
       to_status: snapshot.status,
       reset_at_iso: snapshot.reset,
@@ -158,12 +123,10 @@ const persistQuotaSnapshot = async (upstreamId: string, snapshot: ClaudeCodeQuot
   }
 };
 
-// Best-effort persist: a CAS loss to a concurrent rotation or quota write is
-// fine because the live state already carries a snapshot at least as fresh
-// as the one we'd write. The hot path must not block on the write completing
-// or surface its failures to the caller. Skip writing when the response
-// carries no rate-limit signal at all — that would erase the prior snapshot
-// for no upside.
+// Best-effort persist: the hot path must not block on the write completing or
+// surface its failures to the caller. Skip writing when the response carries
+// no rate-limit signal at all — that would erase the prior snapshot for no
+// upside.
 //
 // On Cloudflare Workers the runtime cancels orphan promises the moment the
 // response is sent to the client, so a bare fire-and-forget would lose the
@@ -237,39 +200,42 @@ const detectTerminalSentinel = (status: number, bodyText: string): string | null
 };
 
 // Terminal flip from the data-plane sentinel detector. Distinct from
-// access-token-cache.ts's `persistTerminalState`: this path runs in a
-// fire-and-forget context with no caller-side state, so we re-read; the
-// flip is body-sentinel-triggered (org disabled/banned), not oauth-error-
-// triggered, so the log carries `upstream_status` instead of `oauth_code`;
-// and a sibling oauth-side flip may have already happened, so we skip the
-// write when the account isn't `active` anymore. Merging the two helpers
-// would force conditional dispatch on every one of these axes.
+// access-token.ts's `persistTerminalState`: this path runs in a
+// fire-and-forget context with no caller-side state, so the account it logs
+// comes from the mutator's own view; the flip is body-sentinel-triggered (org
+// disabled/banned), not oauth-error-triggered, so the log carries
+// `upstream_status` instead of `oauth_code`; and a sibling oauth-side flip may
+// have already happened, so an account that is no longer `active` is returned
+// untouched — the repo reads that as "nothing to do" and the dashboard keeps
+// the first signal. Merging the two helpers would force conditional dispatch
+// on every one of these axes.
 const persistTerminalAccountState = async (
   upstreamId: string,
   terminalMessage: string,
   reason: string,
   upstreamStatus: number,
 ): Promise<void> => {
-  const fresh = await getProviderRepo().upstreams.getById(upstreamId);
-  if (!fresh) return;
-  const state = readClaudeCodeUpstreamState(fresh.state);
-  const account = state.accounts[0];
-  // Already terminal — a sibling write (e.g. an OAuth refresh death) won;
-  // skip overwriting the prior message so the dashboard keeps the first
-  // signal.
-  if (account.state !== 'active') return;
-  const flipped = replaceSoleAccount(state, account => ({
-    ...account,
-    state: 'refresh_failed',
-    stateMessage: terminalMessage,
-    stateUpdatedAt: new Date().toISOString(),
-    accessToken: null,
-  }));
-  await getProviderRepo().upstreams.saveState(upstreamId, flipped, { expectedState: fresh.state });
+  // Stamped before the write for the same reason as the quota snapshot: a
+  // replay must produce the same document.
+  const flippedAt = new Date().toISOString();
+  let previousAccount!: ClaudeCodeAccountCredential;
+  await getProviderRepo().upstreams.saveState(upstreamId, current => {
+    const state = readClaudeCodeUpstreamState(current);
+    previousAccount = state.accounts[0];
+    if (previousAccount.state !== 'active') return state;
+    return replaceSoleAccount(state, account => ({
+      ...account,
+      state: 'refresh_failed',
+      stateMessage: terminalMessage,
+      stateUpdatedAt: flippedAt,
+      accessToken: null,
+    }));
+  });
+  if (previousAccount.state !== 'active') return;
   logWarn('claude_code_account_state_flip', {
     upstream_id: upstreamId,
-    account_uuid: account.accountUuid,
-    from_state: account.state,
+    account_uuid: previousAccount.accountUuid,
+    from_state: previousAccount.state,
     to_state: 'refresh_failed',
     reason,
     upstream_status: upstreamStatus,
@@ -279,10 +245,7 @@ const persistTerminalAccountState = async (
 
 // Fire-and-forget: clones the response so the original body still streams
 // to the caller intact (we surface upstream verbatim — the terminal flip
-// is purely additional dashboard signal). CAS loss to a concurrent
-// rotation is fine: either the sibling already flipped to terminal (no
-// regression) or the sibling rotated state and the next request
-// re-detects the sentinel.
+// is purely additional dashboard signal).
 //
 // Same lifecycle dance as `persistQuotaFromHeadersFireAndForget`: under
 // Workers the runtime cancels orphan promises the moment the response is
@@ -325,22 +288,13 @@ const maybePersistTerminalFromBodyFireAndForget = (
   waitUntil?.(task);
 };
 
-// recordUpstreamLatency contract: every code path that returns must wrap
-// exactly one fetch (real or synthetic). Synthetic gates ride a resolved
-// promise so the gateway's recorder sees the contract met without
-// measuring anything meaningful. Both the pre-flight gates and the 401-retry
-// terminal-state branch use this helper so the two paths read identically;
-// the recorder's "at least once + last wrap kept" contract is satisfied
-// even when the streaming call already wrapped its own fetch upstream of
-// the retry.
-const syntheticReturn = async (
-  opts: CallClaudeCodeMessagesOptions,
+const syntheticReturn = (
   upstreamModelId: string,
   response: Response,
-): Promise<ProviderStreamResult<MessagesStreamEvent>> => ({
+): ProviderStreamResult<MessagesStreamEvent> => ({
   ok: false,
   modelKey: upstreamModelId,
-  response: await opts.call.recordUpstreamLatency(Promise.resolve(response)),
+  response,
 });
 
 // Either ensures a usable access token or returns a 503 wrap for terminal
@@ -359,7 +313,7 @@ const ensureOrSession503 = async (
   } catch (err) {
     if (err instanceof ClaudeCodeOAuthSessionTerminatedError) {
       // ensureClaudeCodeAccessToken already persisted the terminal state.
-      return await syntheticReturn(opts, upstreamModelId, synthetic503(`Claude Code refresh failed: ${err.upstreamMessage}`));
+      return syntheticReturn(upstreamModelId, synthetic503(`Claude Code refresh failed: ${err.upstreamMessage}`));
     }
     throw err;
   }
@@ -368,9 +322,9 @@ const ensureOrSession503 = async (
 export const callClaudeCodeMessages = async (
   opts: CallClaudeCodeMessagesOptions,
 ): Promise<ProviderStreamResult<MessagesStreamEvent>> => {
-  // `model.id` is the public alias on the catalog; the dated upstream id
-  // Anthropic expects on the wire — and that the pricing table keys by —
-  // lives under `providerData.upstreamModelId`. Resolve once so synthetic
+  // `opts.model.id` is the public alias on the catalog; the dated upstream id
+  // Anthropic expects on the wire — and that the pricing table keys by — rides
+  // on `opts.model.providerData.upstreamModelId`. Resolve once so synthetic
   // gates, the wire body, and the streaming-call modelKey all surface the
   // same dated id.
   const upstreamModelId = (opts.model.providerData as ClaudeCodeProviderData).upstreamModelId;
@@ -381,7 +335,7 @@ export const callClaudeCodeMessages = async (
   const account = state.accounts[0];
 
   if (account.state !== 'active') {
-    return await syntheticReturn(opts, upstreamModelId, synthetic503(
+    return syntheticReturn(upstreamModelId, synthetic503(
       `Claude Code account is ${account.state}: ${account.stateMessage}`,
     ));
   }
@@ -390,7 +344,7 @@ export const callClaudeCodeMessages = async (
   const quotaData = account.quotaSnapshot === null ? null : account.quotaSnapshot.data;
   if (isRateLimitedNow(quotaData, now)) {
     const resetIso = quotaData.reset;
-    return await syntheticReturn(opts, upstreamModelId, synthetic429(
+    return syntheticReturn(upstreamModelId, synthetic429(
       resetIso ? `Claude Code upstream rate-limited until ${resetIso}` : 'Claude Code upstream rate-limited',
       resetIso,
       now,
@@ -411,15 +365,11 @@ const performUpstreamCall = async (
 ): Promise<ProviderStreamResult<MessagesStreamEvent>> => {
   let headers: Record<string, string>;
   if (opts.shaped) {
-    // Shaped path: forward the operator's inbound CC fingerprint through a
-    // tight whitelist (see SHAPED_PASSTHROUGH_HEADER_ALLOWLIST). `opts.call.headers`
-    // is always present per the UpstreamCallOptions contract; an empty bag
-    // still produces a working passthrough (just content-type + authorization).
-    const inbound = opts.call.headers;
-    const passthrough: Record<string, string> = {};
-    for (const [name, value] of inbound.entries()) {
-      if (SHAPED_PASSTHROUGH_HEADER_ALLOWLIST.has(name)) passthrough[name] = value;
-    }
+    // The gateway already reduced ordinary headers to the Claude Code module's
+    // allowlist. This path restores typed Messages metadata, preserves the
+    // resulting fingerprint, fills Content-Type when absent, and sets
+    // provider-owned OAuth auth.
+    const passthrough = Object.fromEntries(headersForMessagesCall(opts.call.headers, opts.call.anthropicBeta));
     // Sub2api always sets Content-Type when the inbound omits it
     // (`gateway_service.go` request-forwarding path), so the upstream
     // never receives a body-bearing request without a media type.
@@ -436,12 +386,12 @@ const performUpstreamCall = async (
   // and the real Claude Code client always sets `stream: true`.
   const wireBody: MessagesPayload = { ...opts.body, model: upstreamModelId, stream: true };
 
-  const upstreamFetch = opts.call.fetcher(ANTHROPIC_MESSAGES_ENDPOINT, {
+  const upstreamFetch = opts.call.wrapUpstreamCall(() => opts.call.fetcher(ANTHROPIC_MESSAGES_ENDPOINT, {
     method: 'POST',
     headers,
     body: JSON.stringify(wireBody),
     signal: opts.signal,
-  }, opts.call.recordUpstreamLatency).then(response => {
+  })).then(response => {
     // `opts.call.waitUntil` is set by the gateway on Workers so the
     // runtime keeps the worker alive past the response (without it, the
     // persist promise gets cancelled the moment the response returns).
@@ -474,11 +424,6 @@ const performUpstreamCall = async (
       repo: getProviderRepo().upstreams,
     });
     const ensured = await ensureOrSession503(opts, upstreamModelId);
-    // If the refresh terminated, ensureOrSession503 returns a syntheticReturn
-    // wrap. That wrap intentionally shadows the failed first fetch's recorded
-    // latency under the "last wrap wins" semantics — the telemetry surface
-    // reflects the synthetic 503 because that is what the caller sees, not the
-    // 401 we discarded.
     if ('modelKey' in ensured) return ensured;
     return await performUpstreamCall(opts, upstreamModelId, ensured, true);
   }
